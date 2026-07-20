@@ -1,0 +1,16 @@
+.env
+.venv/
+__pycache__/
+.pytest_cache/
+*.pyc
+data/raw/
+data/reports/
+data/*.db
+.coverage
+node_modules/
+cs2-tier1-analytics-frontend/node_modules/
+*.egg-info/
+cs2-tier1-analytics-frontend/dist/
+app/web/static/assets/*.map
+*.tsbuildinfo
+tests/fixtures/*_files/
