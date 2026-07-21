@@ -30,6 +30,10 @@ from app.validation import validate_data
 logger = logging.getLogger(__name__)
 
 
+def print_json(data: object, *, ensure_ascii: bool = True) -> None:
+    print(json.dumps(data, indent=2, ensure_ascii=ensure_ascii))
+
+
 def add_common_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--dry-run", action="store_true", help="Plan work without network or database writes")
     parser.add_argument("--force-refresh", action="store_true", help="Ignore cached HTML and fetch again")
@@ -333,7 +337,13 @@ def grid_probe_upcoming(args: argparse.Namespace) -> None:
                     "items": items,
                 }
             )
-        print(json.dumps({"top_limit": args.top_limit, "top_snapshot_loaded": bool(top_names), "schema": schema, "windows": windows}, indent=2, ensure_ascii=False))
+        report = {"top_limit": args.top_limit, "top_snapshot_loaded": bool(top_names), "schema": schema, "windows": windows}
+        if args.output:
+            output = Path(args.output)
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+            report = {**report, "saved_to": str(output)}
+        print_json(report)
     except GridApiError as exc:
         print(str(exc))
     finally:
@@ -858,6 +868,7 @@ def build_parser() -> argparse.ArgumentParser:
     grid_probe_parser.add_argument("--max-pages", type=int, default=2)
     grid_probe_parser.add_argument("--first", type=int, default=50)
     grid_probe_parser.add_argument("--limit", type=int, default=60)
+    grid_probe_parser.add_argument("--output", default=f"data/reports/grid-upcoming-probe-{datetime.now(UTC).strftime('%Y%m%d%H%M%S')}.json")
     grid_probe_parser.set_defaults(func=grid_probe_upcoming)
 
     grid_refresh_parser = sub.add_parser("grid-refresh-saved")

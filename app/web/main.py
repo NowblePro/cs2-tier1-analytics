@@ -732,7 +732,7 @@ def upcoming_matches(limit: int = 50, team_id: int | None = None):
             .outerjoin(Event, Match.event_id == Event.id)
             .join(Team1, Match.team1_id == Team1.id)
             .join(Team2, Match.team2_id == Team2.id)
-            .where((Match.status.in_(["scheduled", "live"])) | (Match.match_time >= now))
+            .where((Match.status == "live") | (Match.match_time >= now))
         )
         if team_id is not None:
             query = query.where((Match.team1_id == team_id) | (Match.team2_id == team_id))
@@ -743,8 +743,8 @@ def upcoming_matches(limit: int = 50, team_id: int | None = None):
                 "match_time": match.match_time.isoformat() if match.match_time else None,
                 "status": match.status,
                 "event": event.name if event else None,
-                "team1": team1.name,
-                "team2": team2.name,
+                "team1": {"id": team1.id, "name": team1.name},
+                "team2": {"id": team2.id, "name": team2.name},
                 "score_team1": match.score_team1,
                 "score_team2": match.score_team2,
             }
