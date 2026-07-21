@@ -101,8 +101,9 @@ class GridClient:
         if team_ids:
             filter_parts.append("teamIds: { in: $teamIds }")
         filter_body = ", ".join(filter_parts)
+        team_variable = ", $teamIds: [ID!]" if team_ids else ""
         query = """
-        query AllSeries($gte: String!, $lte: String!, $first: Int!, $after: String, $direction: OrderDirection!, $teamIds: [ID!]) {
+        query AllSeries($gte: String!, $lte: String!, $first: Int!, $after: String, $direction: OrderDirection!%s) {
           allSeries(
             first: $first
             after: $after
@@ -123,7 +124,7 @@ class GridClient:
             pageInfo { endCursor hasNextPage }
           }
         }
-        """ % filter_body
+        """ % (team_variable, filter_body)
         data = self._post(
             self.central_url,
             query,
