@@ -13,7 +13,7 @@ from app.analytics import estimate_backfill
 from app.db import get_session_factory
 from app.logging import configure_logging
 from app.grid import GridClient, ingest_recent_grid_series, ingest_upcoming_grid_series, run_grid_backfill, run_grid_update_since_cursor
-from app.grid.ingest import grid_state_to_match, latest_top_team_names, normalize_name, save_grid_identity_maps, save_raw_grid_state
+from app.grid.ingest import _series_is_cs2, grid_state_to_match, latest_top_team_names, normalize_name, save_grid_identity_maps, save_raw_grid_state
 from app.grid.client import GridApiError, GridSeriesSummary
 from app.grid.stats import refresh_grid_stats
 from app.jobs import run_post_sync_pipeline
@@ -263,6 +263,81 @@ def grid_sync_upcoming(args: argparse.Namespace) -> None:
     finally:
         client.close()
         logger.info("grid-sync-upcoming duration=%.2fs", time.monotonic() - started)
+
+
+def grid_probe_upcoming(args: argparse.Namespace) -> None:
+    settings = get_settings()
+    Session = get_session_factory(settings)
+    try:
+        client = GridClient(settings)
+    except GridApiError as exc:
+        print(str(exc))
+        return
+    try:
+        with Session() as session:
+            top_names = latest_top_team_names(session, args.top_limit)
+        now = datetime.now(UTC).replace(tzinfo=None)
+        schema = {}
+        for type_name in ["SeriesFilter", "SeriesOrderBy", "SeriesWorkflowStatus", "OrderDirection"]:
+            type_info = client.schema_type_info("central", type_name) or {}
+            schema[type_name] = {
+                "kind": type_info.get("kind"),
+                "fields": [
+                    {
+                        "name": field.get("name"),
+                        "type": _format_graphql_type(field.get("type") or {}),
+                        **({"defaultValue": field.get("defaultValue")} if field.get("defaultValue") is not None else {}),
+                    }
+                    for field in (type_info.get("inputFields") or type_info.get("fields") or [])
+                ],
+                "values": [value.get("name") for value in (type_info.get("enumValues") or [])],
+            }
+        windows = []
+        for days in args.windows:
+            date_to = now + timedelta(days=days)
+            after = None
+            pages = 0
+            items = []
+            while pages < args.max_pages:
+                summaries, page_info = client.list_series(now, date_to, first=args.first, after=after, order_direction="ASC")
+                pages += 1
+                for item in summaries:
+                    teams = [(team.get("baseInfo") or {}).get("name") for team in item.teams]
+                    normalized = [normalize_name(name or "") for name in teams]
+                    is_cs2 = _series_is_cs2(item)
+                    matches_top = any(name in top_names for name in normalized)
+                    items.append(
+                        {
+                            "id": item.id,
+                            "startTimeScheduled": item.start_time_scheduled,
+                            "workflowStatus": item.workflow_status,
+                            "titleName": item.title_name,
+                            "tournamentName": item.tournament_name,
+                            "teams": teams,
+                            "isCs2": is_cs2,
+                            "matchesTopFilter": matches_top,
+                        }
+                    )
+                    if len(items) >= args.limit:
+                        break
+                if len(items) >= args.limit or not page_info.get("hasNextPage"):
+                    break
+                after = page_info.get("endCursor")
+            windows.append(
+                {
+                    "days": days,
+                    "pages": pages,
+                    "count": len(items),
+                    "cs2_count": sum(1 for item in items if item["isCs2"]),
+                    "top_filter_count": sum(1 for item in items if item["matchesTopFilter"]),
+                    "items": items,
+                }
+            )
+        print(json.dumps({"top_limit": args.top_limit, "top_snapshot_loaded": bool(top_names), "schema": schema, "windows": windows}, indent=2, ensure_ascii=False))
+    except GridApiError as exc:
+        print(str(exc))
+    finally:
+        client.close()
 
 
 def _grid_series_id_from_source(source_url: str) -> str | None:
@@ -776,6 +851,14 @@ def build_parser() -> argparse.ArgumentParser:
     grid_upcoming_parser.add_argument("--history-max-matches", type=int, default=200)
     grid_upcoming_parser.add_argument("--dry-run", action="store_true")
     grid_upcoming_parser.set_defaults(func=grid_sync_upcoming)
+
+    grid_probe_parser = sub.add_parser("grid-probe-upcoming")
+    grid_probe_parser.add_argument("--top-limit", type=int, default=50)
+    grid_probe_parser.add_argument("--windows", type=int, nargs="+", default=[14, 30, 90])
+    grid_probe_parser.add_argument("--max-pages", type=int, default=2)
+    grid_probe_parser.add_argument("--first", type=int, default=50)
+    grid_probe_parser.add_argument("--limit", type=int, default=60)
+    grid_probe_parser.set_defaults(func=grid_probe_upcoming)
 
     grid_refresh_parser = sub.add_parser("grid-refresh-saved")
     grid_refresh_parser.add_argument("--limit", type=int, default=30)

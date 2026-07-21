@@ -25,6 +25,7 @@ class GridSeriesSummary:
     title_name: str | None
     teams: list[dict[str, Any]]
     title_id: str | None = None
+    workflow_status: str | None = None
 
 
 class GridClient:
@@ -87,19 +88,28 @@ class GridClient:
             raise GridApiError(f"GRID API GraphQL errors: {payload['errors']}")
         return payload["data"]
 
-    def list_series(self, date_from: datetime, date_to: datetime, first: int = 50, after: str | None = None) -> tuple[list[GridSeriesSummary], dict[str, Any]]:
+    def list_series(
+        self,
+        date_from: datetime,
+        date_to: datetime,
+        first: int = 50,
+        after: str | None = None,
+        order_direction: str = "ASC",
+    ) -> tuple[list[GridSeriesSummary], dict[str, Any]]:
         query = """
-        query AllSeries($gte: String!, $lte: String!, $first: Int!, $after: String) {
+        query AllSeries($gte: String!, $lte: String!, $first: Int!, $after: String, $direction: OrderDirection!) {
           allSeries(
             first: $first
             after: $after
             filter: { startTimeScheduled: { gte: $gte, lte: $lte } }
             orderBy: StartTimeScheduled
+            orderDirection: $direction
           ) {
             edges {
               node {
                 id
                 startTimeScheduled
+                workflowStatus
                 title { id name }
                 teams { baseInfo { id name } }
                 tournament { id name }
@@ -117,6 +127,7 @@ class GridClient:
                 "lte": date_to.strftime("%Y-%m-%dT%H:%M:%SZ"),
                 "first": first,
                 "after": after,
+                "direction": order_direction,
             },
         )
         series = data["allSeries"]
@@ -128,10 +139,34 @@ class GridClient:
                 title_name=(edge["node"].get("title") or {}).get("name"),
                 teams=edge["node"].get("teams") or [],
                 title_id=(edge["node"].get("title") or {}).get("id"),
+                workflow_status=edge["node"].get("workflowStatus"),
             )
             for edge in series["edges"]
         ]
         return rows, series["pageInfo"]
+
+    def schema_type_info(self, endpoint: str, type_name: str) -> dict[str, Any] | None:
+        url = self._endpoint_url(endpoint)
+        query = """
+        query TypeInfo($name: String!) {
+          __type(name: $name) {
+            name
+            kind
+            fields {
+              name
+              args { name type { kind name ofType { kind name ofType { kind name } } } }
+              type { kind name ofType { kind name ofType { kind name } } }
+            }
+            inputFields {
+              name
+              defaultValue
+              type { kind name ofType { kind name ofType { kind name } } }
+            }
+            enumValues { name }
+          }
+        }
+        """
+        return self._post(url, query, {"name": type_name}).get("__type")
 
     def series_state(self, series_id: str) -> dict[str, Any]:
         query = """
@@ -334,8 +369,7 @@ class GridClient:
           }
         }
         """
-        data = self._post(url, query, {"name": type_name})
-        type_info = data.get("__type")
+        type_info = self.schema_type_info(endpoint, type_name)
         if not type_info:
             return []
         return type_info.get("fields") or type_info.get("inputFields") or type_info.get("enumValues") or []
