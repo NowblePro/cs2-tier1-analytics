@@ -12,7 +12,7 @@ from app.config import get_settings
 from app.analytics import estimate_backfill
 from app.db import get_session_factory
 from app.logging import configure_logging
-from app.grid import GridClient, ingest_recent_grid_series, ingest_upcoming_grid_series, run_grid_backfill, run_grid_update_since_cursor
+from app.grid import GridClient, ingest_recent_grid_series, ingest_upcoming_grid_series, refresh_live_grid_matches, run_grid_backfill, run_grid_update_since_cursor
 from app.grid.ingest import _series_is_cs2, grid_state_to_match, latest_top_team_names, normalize_name, save_grid_identity_maps, save_raw_grid_state
 from app.grid.client import GridApiError, GridSeriesSummary
 from app.grid.stats import refresh_grid_stats
@@ -416,6 +416,27 @@ def grid_refresh_saved(args: argparse.Namespace) -> None:
     finally:
         client.close()
         logger.info("grid-refresh-saved duration=%.2fs", time.monotonic() - started)
+
+
+def grid_refresh_live(args: argparse.Namespace) -> None:
+    settings = get_settings()
+    Session = get_session_factory(settings)
+    Base.metadata.create_all(Session.kw["bind"])
+    started = time.monotonic()
+    try:
+        client = GridClient(settings)
+    except GridApiError as exc:
+        print(str(exc))
+        return
+    try:
+        with Session.begin() as session:
+            result = refresh_live_grid_matches(session=session, client=client, limit=args.limit, dry_run=args.dry_run)
+            if not args.dry_run and not args.no_metrics:
+                compute_metrics(session)
+        print(json.dumps(result, indent=2, ensure_ascii=True))
+    finally:
+        client.close()
+        logger.info("grid-refresh-live duration=%.2fs", time.monotonic() - started)
 
 
 def grid_scan_series(args: argparse.Namespace) -> None:
@@ -875,6 +896,12 @@ def build_parser() -> argparse.ArgumentParser:
     grid_refresh_parser.add_argument("--limit", type=int, default=30)
     grid_refresh_parser.add_argument("--no-metrics", action="store_true")
     grid_refresh_parser.set_defaults(func=grid_refresh_saved)
+
+    grid_refresh_live_parser = sub.add_parser("grid-refresh-live")
+    grid_refresh_live_parser.add_argument("--limit", type=int, default=50)
+    grid_refresh_live_parser.add_argument("--dry-run", action="store_true")
+    grid_refresh_live_parser.add_argument("--no-metrics", action="store_true")
+    grid_refresh_live_parser.set_defaults(func=grid_refresh_live)
 
     grid_scan_parser = sub.add_parser("grid-scan-series")
     grid_scan_parser.add_argument("--days", type=int, default=7)

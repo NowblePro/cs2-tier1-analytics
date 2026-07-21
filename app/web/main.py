@@ -17,7 +17,7 @@ from sqlalchemy.orm import aliased
 from app.config import get_settings
 from app.analytics import estimate_backfill, grid_stats_summary, pre_match_edge
 from app.db import get_session_factory
-from app.grid import GridClient, ingest_recent_grid_series, ingest_upcoming_grid_series, run_grid_backfill, run_grid_update_since_cursor
+from app.grid import GridClient, ingest_recent_grid_series, ingest_upcoming_grid_series, refresh_live_grid_matches, run_grid_backfill, run_grid_update_since_cursor
 from app.grid.client import GridApiError
 from app.grid.ingest import normalize_name
 from app.grid.stats import refresh_grid_stats
@@ -37,7 +37,7 @@ _schema_ready = False
 
 
 class GridSyncRequest(BaseModel):
-    mode: str = Field(default="recent", pattern="^(recent|backfill|update|upcoming)$")
+    mode: str = Field(default="recent", pattern="^(recent|backfill|update|upcoming|refresh-live)$")
     days: int = Field(default=7, ge=1, le=365)
     date_from: datetime | None = None
     date_to: datetime | None = None
@@ -251,6 +251,9 @@ def _comparison_metric_rows(team1: dict[str, Any], team2: dict[str, Any]) -> lis
         ("Map win rate", metrics1.get("map_win_rate"), metrics2.get("map_win_rate"), "percent"),
         ("K/D", metrics1.get("kd_ratio"), metrics2.get("kd_ratio"), "number"),
         ("ADR", metrics1.get("avg_adr"), metrics2.get("avg_adr"), "number"),
+        ("T round win rate", metrics1.get("t_round_win_rate"), metrics2.get("t_round_win_rate"), "percent"),
+        ("CT round win rate", metrics1.get("ct_round_win_rate"), metrics2.get("ct_round_win_rate"), "percent"),
+        ("Pistol win rate", metrics1.get("pistol_win_rate"), metrics2.get("pistol_win_rate"), "percent"),
         ("GRID series WR", grid1.get("series_win_rate"), grid2.get("series_win_rate"), "grid_percent"),
         ("First kill", grid1.get("first_kill_rate"), grid2.get("first_kill_rate"), "grid_percent"),
     ]
@@ -468,6 +471,13 @@ def _run_grid_sync_job(job_id: str, payload: GridSyncRequest) -> None:
                     history_days=payload.history_days,
                     history_max_pages=payload.history_max_pages,
                     history_max_matches=payload.history_max_matches,
+                )
+            elif payload.mode == "refresh-live":
+                result = refresh_live_grid_matches(
+                    session=session,
+                    client=client,
+                    limit=payload.max_matches,
+                    dry_run=payload.dry_run,
                 )
             else:
                 result = ingest_recent_grid_series(

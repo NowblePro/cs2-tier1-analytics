@@ -4,7 +4,7 @@ import hashlib
 import json
 import re
 import logging
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from sqlalchemy import desc, select
@@ -16,7 +16,7 @@ from app.repositories import AnalyticsRepository
 from app.repositories.team_aliases import find_team_by_alias
 from app.scraping.dto import MapDTO, MatchDTO, PlayerStatDTO, TeamDTO
 from app.scraping.player_stats_parser import calculate_kd_ratio
-from app.models.schema import GridEntityMap, GridRawSeriesState, Player, RankingSnapshot, RankingSnapshotTeam, Team
+from app.models.schema import Event, GridEntityMap, GridRawSeriesState, Match, Player, RankingSnapshot, RankingSnapshotTeam, Team
 
 logger = logging.getLogger(__name__)
 
@@ -130,6 +130,16 @@ def _series_team_names(summary: GridSeriesSummary) -> list[str]:
         if name:
             names.append(name)
     return names
+
+
+def _series_team_grid_ids(summary: GridSeriesSummary) -> list[str]:
+    ids = []
+    for team in summary.teams:
+        base = team.get("baseInfo") or {}
+        grid_id = base.get("id")
+        if grid_id:
+            ids.append(str(grid_id))
+    return ids
 
 
 def _series_involves_top_team(summary: GridSeriesSummary, top_names: set[str]) -> bool:
@@ -477,6 +487,155 @@ def ingest_grid_history_for_team_names(
     }
 
 
+def ingest_grid_history_for_team_ids(
+    session: Session,
+    client: GridClient,
+    team_ids: set[str],
+    date_from: datetime,
+    date_to: datetime,
+    max_pages: int,
+    max_matches: int,
+    dry_run: bool = False,
+) -> dict[str, int]:
+    normalized_ids = {str(team_id) for team_id in team_ids if team_id}
+    repo = AnalyticsRepository(session)
+    page = 0
+    checked = matched = saved = skipped = errors = 0
+    if not normalized_ids:
+        return {"pages": 0, "checked": 0, "matched": 0, "saved": 0, "skipped": 0, "errors": 0, "new_matches": 0, "updated_matches": 0}
+    for team_id in sorted(normalized_ids):
+        after = None
+        while page < max_pages and saved < max_matches:
+            summaries, page_info = client.list_series(date_from, date_to, first=50, after=after, team_ids=[team_id])
+            page += 1
+            for summary in summaries:
+                checked += 1
+                if not _series_is_cs2(summary):
+                    skipped += 1
+                    continue
+                matched += 1
+                if dry_run:
+                    continue
+                try:
+                    state = client.series_state(summary.id)
+                    save_raw_grid_state(session, summary.id, state)
+                    dto = grid_state_to_match(summary, state, session)
+                except GridApiError as exc:
+                    logger.warning("Skipping GRID team history series %s: %s", summary.id, exc)
+                    errors += 1
+                    skipped += 1
+                    continue
+                if dto is None:
+                    skipped += 1
+                    continue
+                repo.save_match(dto)
+                save_grid_identity_maps(session, summary, state, dto)
+                saved += 1
+                if saved >= max_matches:
+                    break
+            if not page_info.get("hasNextPage"):
+                break
+            after = page_info.get("endCursor")
+        if page >= max_pages or saved >= max_matches:
+            break
+    return {
+        "pages": page,
+        "checked": checked,
+        "matched": matched,
+        "saved": saved,
+        "skipped": skipped,
+        "errors": errors,
+        "new_matches": repo.new_matches,
+        "updated_matches": repo.updated_matches,
+    }
+
+
+def _grid_series_id_from_source(source_url: str | None) -> str | None:
+    prefix = "grid://series/"
+    if source_url and source_url.startswith(prefix):
+        return source_url[len(prefix):]
+    return None
+
+
+def _local_match_summary(session: Session, match: Match) -> GridSeriesSummary | None:
+    series_id = _grid_series_id_from_source(match.source_url)
+    if not series_id:
+        return None
+    team1 = session.get(Team, match.team1_id) if match.team1_id else None
+    team2 = session.get(Team, match.team2_id) if match.team2_id else None
+    if team1 is None or team2 is None:
+        return None
+    event = session.get(Event, match.event_id) if match.event_id else None
+    team_nodes = []
+    for team in [team1, team2]:
+        entity = session.scalar(select(GridEntityMap).where(GridEntityMap.entity_type == "team", GridEntityMap.local_id == team.id).order_by(desc(GridEntityMap.updated_at)).limit(1))
+        team_nodes.append({"baseInfo": {"id": entity.grid_id if entity else f"local-{team.id}", "name": team.name}})
+    return GridSeriesSummary(
+        id=series_id,
+        start_time_scheduled=match.match_time.strftime("%Y-%m-%dT%H:%M:%SZ") if match.match_time else None,
+        tournament_name=event.name if event else None,
+        title_name="Counter Strike 2",
+        teams=team_nodes,
+    )
+
+
+def refresh_live_grid_matches(
+    session: Session,
+    client: GridClient,
+    *,
+    limit: int = 50,
+    dry_run: bool = False,
+) -> dict[str, int]:
+    repo = AnalyticsRepository(session)
+    now = datetime.now(UTC).replace(tzinfo=None)
+    matches = session.scalars(
+        select(Match)
+        .where(
+            Match.source_url.like("grid://series/%"),
+            (Match.status.in_(["scheduled", "live"])) | (Match.match_time >= now),
+        )
+        .order_by(Match.match_time.asc(), Match.id.asc())
+        .limit(limit)
+    ).all()
+    checked = refreshed = skipped = errors = state_errors = completed = 0
+    for match in matches:
+        checked += 1
+        summary = _local_match_summary(session, match)
+        if summary is None:
+            skipped += 1
+            continue
+        if dry_run:
+            refreshed += 1
+            continue
+        try:
+            state = client.series_state(summary.id)
+            save_raw_grid_state(session, summary.id, state)
+        except GridApiError as exc:
+            logger.warning("GRID live refresh state unavailable for %s: %s", summary.id, exc)
+            state_errors += 1
+            skipped += 1
+            continue
+        dto = grid_state_to_match(summary, state, session)
+        if dto is None:
+            skipped += 1
+            continue
+        repo.save_match(dto)
+        save_grid_identity_maps(session, summary, state, dto)
+        refreshed += 1
+        if dto.status == "completed":
+            completed += 1
+    return {
+        "checked": checked,
+        "refreshed": refreshed,
+        "skipped": skipped,
+        "errors": errors,
+        "state_errors": state_errors,
+        "completed": completed,
+        "new_matches": repo.new_matches,
+        "updated_matches": repo.updated_matches,
+    }
+
+
 def ingest_upcoming_grid_series(
     session: Session,
     client: GridClient,
@@ -499,6 +658,7 @@ def ingest_upcoming_grid_series(
     after = None
     checked = matched = saved = skipped = errors = state_errors = 0
     involved_names: set[str] = set()
+    involved_grid_team_ids: set[str] = set()
     while page < max_pages and saved < max_matches:
         summaries, page_info = client.list_series(date_from, date_to, first=50, after=after)
         page += 1
@@ -510,6 +670,7 @@ def ingest_upcoming_grid_series(
             matched += 1
             for name in _series_team_names(summary):
                 involved_names.add(name)
+            involved_grid_team_ids.update(_series_team_grid_ids(summary))
             if dry_run:
                 continue
             state: dict[str, Any] = {}
@@ -540,16 +701,28 @@ def ingest_upcoming_grid_series(
     if history_days > 0 and involved_names and history_max_matches > 0:
         history_to = date_from
         history_from = history_to - timedelta(days=history_days)
-        history_result = ingest_grid_history_for_team_names(
-            session=session,
-            client=client,
-            team_names=involved_names,
-            date_from=history_from,
-            date_to=history_to,
-            max_pages=history_max_pages,
-            max_matches=history_max_matches,
-            dry_run=dry_run,
-        )
+        if involved_grid_team_ids:
+            history_result = ingest_grid_history_for_team_ids(
+                session=session,
+                client=client,
+                team_ids=involved_grid_team_ids,
+                date_from=history_from,
+                date_to=history_to,
+                max_pages=history_max_pages,
+                max_matches=history_max_matches,
+                dry_run=dry_run,
+            )
+        else:
+            history_result = ingest_grid_history_for_team_names(
+                session=session,
+                client=client,
+                team_names=involved_names,
+                date_from=history_from,
+                date_to=history_to,
+                max_pages=history_max_pages,
+                max_matches=history_max_matches,
+                dry_run=dry_run,
+            )
 
     return {
         "pages": page,
@@ -562,5 +735,6 @@ def ingest_upcoming_grid_series(
         "new_matches": repo.new_matches,
         "updated_matches": repo.updated_matches,
         "involved_teams": sorted(involved_names),
+        "involved_grid_team_ids": sorted(involved_grid_team_ids),
         "history": history_result,
     }

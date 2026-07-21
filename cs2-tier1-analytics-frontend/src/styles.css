@@ -73,6 +73,9 @@ footer { height: 46px; display: flex; justify-content: space-between; align-item
 .page-title h1 { margin: 3px 0 3px; font-size: 24px; line-height: 1.25; letter-spacing: -.025em; }
 .page-title p { margin: 0; color: var(--text-2); font-size: 13px; }
 .page-actions { display: flex; gap: 8px; }
+.compact-select { display: grid; gap: 4px; min-width: 132px; }
+.compact-select span { color: var(--text-3); font-size: 9px; font-weight: 800; text-transform: uppercase; letter-spacing: .05em; }
+.compact-select select { min-width: 132px; }
 .button { min-height: 34px; padding: 0 13px; border: 1px solid var(--border); border-radius: 6px; font-weight: 700; font-size: 12px; cursor: pointer; }
 .button:disabled { opacity: .45; cursor: not-allowed; }
 .button.primary { color: #071018; background: var(--accent); border-color: var(--accent); }

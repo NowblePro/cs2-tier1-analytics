@@ -385,12 +385,15 @@ function MatchDetailDrawer({ match, onClose }: { match: JsonRecord; onClose: () 
   </aside>;
 }
 
-function Upcoming({ filters }: { filters: typeof initialFilters }) {
+function Upcoming({ filters, setFilters }: { filters: typeof initialFilters; setFilters: React.Dispatch<React.SetStateAction<typeof initialFilters>> }) {
   const upcoming = useResource(() => api.get("/api/upcoming", { days: filters.days }), demo.upcoming, [filters.days]);
   const rows = asArray(upcoming.data, ["upcoming", "matches", "items", "results"]);
   const [selected, setSelected] = useState<JsonRecord | null>(null);
   return <>
-    <PageTitle eyebrow="Pre-match analysis" title="Upcoming matches" description="Rule-based edges with explicit confidence and sample context." />
+    <PageTitle eyebrow="Pre-match analysis" title="Upcoming matches" description="Rule-based edges with explicit confidence and sample context.">
+      <label className="compact-select"><span>Last matches</span><select value={filters.window} onChange={(event) => setFilters((current) => ({ ...current, window: Number(event.target.value) }))}>{[5, 10, 20, 50].map((value) => <option key={value}>{value}</option>)}</select></label>
+      <label className="compact-select"><span>GRID window</span><select value={filters.statsWindow} onChange={(event) => setFilters((current) => ({ ...current, statsWindow: event.target.value }))}>{["LAST_WEEK", "LAST_MONTH", "LAST_3_MONTHS", "LAST_6_MONTHS", "LAST_YEAR"].map((value) => <option key={value} value={value}>{value.replaceAll("_", " ")}</option>)}</select></label>
+    </PageTitle>
     <div className="upcoming-layout">
       <Panel title="Schedule" meta={`${rows.length} upcoming series`}>
         <TableState loading={upcoming.loading} error={upcoming.error} empty={!rows.length} onRetry={upcoming.reload} />
@@ -511,7 +514,7 @@ function DataPage() {
       <Panel title="Sync scope" meta="Long-running, data-changing operations">
         <div className="form-grid"><label><span>From</span><input type="datetime-local" value={from} onChange={(event) => setFrom(event.target.value)} /></label><label><span>To</span><input type="datetime-local" value={to} onChange={(event) => setTo(event.target.value)} /></label><label><span>Backfill days</span><input type="number" min="1" max="365" value={backfillDays} onChange={(event) => setBackfillDays(Number(event.target.value))} /></label><label><span>Max pages</span><input type="number" min="1" value={maxPages} onChange={(event) => setMaxPages(Number(event.target.value))} /></label><label><span>Max matches</span><input type="number" min="1" value={maxMatches} onChange={(event) => setMaxMatches(Number(event.target.value))} /></label></div>
         <div className="toggle-list"><Toggle label="Auto sync" value={toggles.autoSync} onChange={(value) => setToggles({ ...toggles, autoSync: value })} /><Toggle label="No top filter" value={toggles.noTop} onChange={(value) => setToggles({ ...toggles, noTop: value })} /><Toggle label="Run full pipeline" value={toggles.pipeline} onChange={(value) => setToggles({ ...toggles, pipeline: value })} /><Toggle label="Stats after sync" value={toggles.statsAfter} onChange={(value) => setToggles({ ...toggles, statsAfter: value })} /></div>
-        <div className="action-grid"><button className="button primary" disabled={!!running} onClick={() => run("GRID sync", "/api/sync/grid", "POST", { from, to, max_pages: maxPages, max_matches: maxMatches, pipeline: toggles.pipeline, stats_after_sync: toggles.statsAfter, no_top_filter: toggles.noTop })}>Sync GRID</button><button className="button ghost" disabled={!!running} onClick={() => run("Sync upcoming", "/api/sync/grid", "POST", { mode: "upcoming", days: 14, top_limit: 50, max_pages: maxPages, max_matches: maxMatches, history_days: 90, history_max_pages: 20, history_max_matches: 200, pipeline: toggles.pipeline, stats_after_sync: toggles.statsAfter })}>Sync upcoming</button><button className="button ghost" disabled={!!running} onClick={() => run("Dry run", "/api/sync/grid", "POST", { dry_run: true, from, to, max_pages: maxPages, max_matches: maxMatches })}>Dry run</button><button className="button ghost" disabled={!!running} onClick={() => run("Stats refresh", "/api/sync/grid-stats", "POST", { window: "LAST_3_MONTHS" })}>Refresh stats</button><button className="button ghost" disabled={!!running} onClick={() => run("Metrics compute", "/api/metrics/compute")}>Compute metrics</button><button className="button ghost" disabled={!!running} onClick={() => run("Validation", "/api/validate", "GET")}>Validate</button></div>
+        <div className="action-grid"><button className="button primary" disabled={!!running} onClick={() => run("GRID sync", "/api/sync/grid", "POST", { date_from: from || undefined, date_to: to || undefined, max_pages: maxPages, max_matches: maxMatches, post_pipeline: toggles.pipeline, refresh_stats: toggles.statsAfter, require_top_team: !toggles.noTop })}>Sync GRID</button><button className="button ghost" disabled={!!running} onClick={() => run("Sync upcoming", "/api/sync/grid", "POST", { mode: "upcoming", days: 14, top_limit: 50, max_pages: maxPages, max_matches: maxMatches, history_days: 90, history_max_pages: 20, history_max_matches: 200, post_pipeline: toggles.pipeline, refresh_stats: toggles.statsAfter })}>Sync upcoming</button><button className="button ghost" disabled={!!running} onClick={() => run("Refresh live/upcoming", "/api/sync/grid", "POST", { mode: "refresh-live", max_matches: maxMatches, post_pipeline: toggles.pipeline, refresh_stats: toggles.statsAfter })}>Refresh live</button><button className="button ghost" disabled={!!running} onClick={() => run("Dry run", "/api/sync/grid", "POST", { dry_run: true, date_from: from || undefined, date_to: to || undefined, max_pages: maxPages, max_matches: maxMatches })}>Dry run</button><button className="button ghost" disabled={!!running} onClick={() => run("Stats refresh", "/api/sync/grid-stats", "POST", { window: "LAST_3_MONTHS" })}>Refresh stats</button><button className="button ghost" disabled={!!running} onClick={() => run("Metrics compute", "/api/metrics/compute")}>Compute metrics</button><button className="button ghost" disabled={!!running} onClick={() => run("Validation", "/api/validate", "GET")}>Validate</button></div>
       </Panel>
       <Panel title="Backfill estimate" meta="Recalculate before starting a historical fetch">
         <TableState loading={estimate.loading} error={estimate.error} empty={false} onRetry={estimate.reload} />
@@ -545,7 +548,7 @@ export default function App() {
       {page === "dashboard" && <Dashboard filters={filters} setPage={setPage} />}
       {page === "teams" && <Teams filters={filters} setFilters={setFilters} />}
       {page === "matches" && <Matches filters={filters} setFilters={setFilters} />}
-      {page === "upcoming" && <Upcoming filters={filters} />}
+      {page === "upcoming" && <Upcoming filters={filters} setFilters={setFilters} />}
       {page === "data" && <DataPage />}
     </main>
     <footer><span>CS2 Tier-1 Analytics</span><span>Local workspace · GRID data</span></footer>

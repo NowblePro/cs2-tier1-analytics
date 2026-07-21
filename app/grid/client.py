@@ -95,13 +95,18 @@ class GridClient:
         first: int = 50,
         after: str | None = None,
         order_direction: str = "ASC",
+        team_ids: list[str] | None = None,
     ) -> tuple[list[GridSeriesSummary], dict[str, Any]]:
+        filter_parts = ["startTimeScheduled: { gte: $gte, lte: $lte }"]
+        if team_ids:
+            filter_parts.append("teamIds: { in: $teamIds }")
+        filter_body = ", ".join(filter_parts)
         query = """
-        query AllSeries($gte: String!, $lte: String!, $first: Int!, $after: String, $direction: OrderDirection!) {
+        query AllSeries($gte: String!, $lte: String!, $first: Int!, $after: String, $direction: OrderDirection!, $teamIds: [ID!]) {
           allSeries(
             first: $first
             after: $after
-            filter: { startTimeScheduled: { gte: $gte, lte: $lte } }
+            filter: { %s }
             orderBy: StartTimeScheduled
             orderDirection: $direction
           ) {
@@ -118,7 +123,7 @@ class GridClient:
             pageInfo { endCursor hasNextPage }
           }
         }
-        """
+        """ % filter_body
         data = self._post(
             self.central_url,
             query,
@@ -128,6 +133,7 @@ class GridClient:
                 "first": first,
                 "after": after,
                 "direction": order_direction,
+                "teamIds": team_ids,
             },
         )
         series = data["allSeries"]
