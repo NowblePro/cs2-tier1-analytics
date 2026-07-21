@@ -201,6 +201,161 @@ def _team_players(session, team_id: int, limit: int = 10) -> list[dict[str, Any]
     ]
 
 
+def _team_map_pool(session, team_id: int, limit: int) -> list[dict[str, Any]]:
+    matches = session.scalars(
+        select(Match)
+        .where((Match.team1_id == team_id) | (Match.team2_id == team_id))
+        .order_by(desc(Match.match_time), desc(Match.id))
+        .limit(limit)
+    ).all()
+    by_name: dict[str, dict[str, Any]] = {}
+    if not matches:
+        return []
+    maps = session.scalars(select(MatchMap).where(MatchMap.match_id.in_([match.id for match in matches]))).all()
+    match_by_id = {match.id: match for match in matches}
+    for item in maps:
+        if item.score_team1 is None or item.score_team2 is None:
+            continue
+        match = match_by_id.get(item.match_id)
+        if match is None:
+            continue
+        if match.team1_id == team_id:
+            rounds_for, rounds_against = item.score_team1, item.score_team2
+        else:
+            rounds_for, rounds_against = item.score_team2, item.score_team1
+        row = by_name.setdefault(item.name, {"map": item.name, "played": 0, "wins": 0, "round_diff": 0})
+        row["played"] += 1
+        row["round_diff"] += int(rounds_for or 0) - int(rounds_against or 0)
+        if item.winner_team_id == team_id:
+            row["wins"] += 1
+    result = []
+    for row in by_name.values():
+        result.append(
+            {
+                "map": row["map"],
+                "played": row["played"],
+                "win_rate": _ratio(row["wins"], row["played"]),
+                "round_diff": row["round_diff"],
+            }
+        )
+    return sorted(result, key=lambda row: (-row["played"], row["map"]))
+
+
+def _comparison_metric_rows(team1: dict[str, Any], team2: dict[str, Any]) -> list[dict[str, Any]]:
+    metrics1 = team1.get("metrics") or {}
+    metrics2 = team2.get("metrics") or {}
+    grid1 = grid_stats_summary(team1.get("grid_stats"))
+    grid2 = grid_stats_summary(team2.get("grid_stats"))
+    rows = [
+        ("Series win rate", metrics1.get("match_win_rate"), metrics2.get("match_win_rate"), "percent"),
+        ("Map win rate", metrics1.get("map_win_rate"), metrics2.get("map_win_rate"), "percent"),
+        ("K/D", metrics1.get("kd_ratio"), metrics2.get("kd_ratio"), "number"),
+        ("ADR", metrics1.get("avg_adr"), metrics2.get("avg_adr"), "number"),
+        ("GRID series WR", grid1.get("series_win_rate"), grid2.get("series_win_rate"), "grid_percent"),
+        ("First kill", grid1.get("first_kill_rate"), grid2.get("first_kill_rate"), "grid_percent"),
+    ]
+    return [
+        {
+            "label": label,
+            "team1_value": value1,
+            "team2_value": value2,
+            "unit": unit,
+            "leader": "team1" if value1 is not None and (value2 is None or value1 > value2) else "team2" if value2 is not None and (value1 is None or value2 > value1) else "tie",
+        }
+        for label, value1, value2, unit in rows
+    ]
+
+
+def _map_pool_comparison(team1_maps: list[dict[str, Any]], team2_maps: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    maps1 = {row["map"]: row for row in team1_maps}
+    maps2 = {row["map"]: row for row in team2_maps}
+    result = []
+    for name in sorted(set(maps1) | set(maps2)):
+        row1 = maps1.get(name) or {}
+        row2 = maps2.get(name) or {}
+        value1 = row1.get("win_rate")
+        value2 = row2.get("win_rate")
+        result.append(
+            {
+                "map": name,
+                "team1_win_rate": value1,
+                "team2_win_rate": value2,
+                "team1_sample": row1.get("played", 0),
+                "team2_sample": row2.get("played", 0),
+                "team1_round_diff": row1.get("round_diff"),
+                "team2_round_diff": row2.get("round_diff"),
+                "state": "insufficient_sample" if (row1.get("played", 0) < 3 or row2.get("played", 0) < 3) else "ready",
+                "leader": "team1" if value1 is not None and (value2 is None or value1 > value2) else "team2" if value2 is not None and (value1 is None or value2 > value1) else "tie",
+            }
+        )
+    return result
+
+
+def _coverage(team: dict[str, Any]) -> dict[str, Any]:
+    metrics = team.get("metrics") or {}
+    players = team.get("players") or []
+    grid_summary = grid_stats_summary(team.get("grid_stats"))
+    matches = int(metrics.get("matches_played") or 0)
+    maps = int(metrics.get("maps_played") or 0)
+    players_with_stats = sum(1 for player in players if (player.get("maps") or 0) > 0)
+    grid_series = int(grid_summary.get("series_count") or 0)
+    score = min(100, matches * 4 + maps * 2 + players_with_stats * 5 + grid_series * 3)
+    level = "high" if score >= 70 else "medium" if score >= 35 else "low"
+    warnings = []
+    if matches < 5:
+        warnings.append("low recent match sample")
+    if players_with_stats < 5:
+        warnings.append("incomplete player sample")
+    if grid_series == 0:
+        warnings.append("no GRID stats snapshot")
+    return {
+        "score": score,
+        "level": level,
+        "matches": matches,
+        "maps": maps,
+        "players_with_stats": players_with_stats,
+        "grid_series": grid_series,
+        "warnings": warnings,
+    }
+
+
+def _preview_payload(session, team1: Team, team2: Team, window: int, stats_window: str) -> dict[str, Any]:
+    team1_maps = _team_map_pool(session, team1.id, window)
+    team2_maps = _team_map_pool(session, team2.id, window)
+    team1_payload = {
+        "id": team1.id,
+        "name": team1.name,
+        "metrics": _team_recent_metrics(session, team1.id, window),
+        "recent_matches": _team_recent_matches(session, team1.id, 5),
+        "grid_stats": _team_grid_stats(session, team1.id, team1.name, stats_window),
+        "players": _team_players(session, team1.id, 5),
+        "map_pool": team1_maps,
+    }
+    team2_payload = {
+        "id": team2.id,
+        "name": team2.name,
+        "metrics": _team_recent_metrics(session, team2.id, window),
+        "recent_matches": _team_recent_matches(session, team2.id, 5),
+        "grid_stats": _team_grid_stats(session, team2.id, team2.name, stats_window),
+        "players": _team_players(session, team2.id, 5),
+        "map_pool": team2_maps,
+    }
+    coverage1 = _coverage(team1_payload)
+    coverage2 = _coverage(team2_payload)
+    warnings = [f"{team1.name}: {item}" for item in coverage1["warnings"]] + [f"{team2.name}: {item}" for item in coverage2["warnings"]]
+    return {
+        "window": window,
+        "stats_window": stats_window,
+        "team1": team1_payload,
+        "team2": team2_payload,
+        "edge": pre_match_edge(team1_payload, team2_payload),
+        "metrics": _comparison_metric_rows(team1_payload, team2_payload),
+        "map_pool": _map_pool_comparison(team1_maps, team2_maps),
+        "player_form": {"team1": team1_payload["players"], "team2": team2_payload["players"]},
+        "coverage": {"team1": coverage1, "team2": coverage2, "warnings": warnings},
+    }
+
+
 def _team_grid_stats(session, team_id: int, team_name: str | None = None, window: str = "LAST_MONTH") -> dict[str, Any] | None:
     row = session.scalar(
         select(GridStatsSnapshot)
@@ -503,16 +658,7 @@ def compare_teams(team1_id: int, team2_id: int, window: int = 20, stats_window: 
         team2 = session.get(Team, team2_id)
         if team1 is None or team2 is None:
             return {"ok": False, "error": "Team not found"}
-        team1_payload = {"id": team1.id, "name": team1.name, "metrics": _team_recent_metrics(session, team1.id, window), "grid_stats": _team_grid_stats(session, team1.id, team1.name, stats_window)}
-        team2_payload = {"id": team2.id, "name": team2.name, "metrics": _team_recent_metrics(session, team2.id, window), "grid_stats": _team_grid_stats(session, team2.id, team2.name, stats_window)}
-        return {
-            "ok": True,
-            "window": window,
-            "stats_window": stats_window,
-            "team1": team1_payload,
-            "team2": team2_payload,
-            "edge": pre_match_edge(team1_payload, team2_payload),
-        }
+        return {"ok": True, **_preview_payload(session, team1, team2, window, stats_window)}
 
 
 @app.get("/api/teams/{team_id}/players")
@@ -671,8 +817,6 @@ def match_preview(match_id: int, window: int = 20, stats_window: str = "LAST_MON
         if team1 is None or team2 is None:
             return {"ok": False, "error": "Match does not have two teams"}
         event = session.get(Event, match.event_id) if match.event_id else None
-        team1_payload = {"id": team1.id, "name": team1.name, "metrics": _team_recent_metrics(session, team1.id, window), "recent_matches": _team_recent_matches(session, team1.id, 5), "grid_stats": _team_grid_stats(session, team1.id, team1.name, stats_window), "players": _team_players(session, team1.id, 5)}
-        team2_payload = {"id": team2.id, "name": team2.name, "metrics": _team_recent_metrics(session, team2.id, window), "recent_matches": _team_recent_matches(session, team2.id, 5), "grid_stats": _team_grid_stats(session, team2.id, team2.name, stats_window), "players": _team_players(session, team2.id, 5)}
         return {
             "ok": True,
             "match": {
@@ -685,13 +829,7 @@ def match_preview(match_id: int, window: int = 20, stats_window: str = "LAST_MON
                 "score_team1": match.score_team1,
                 "score_team2": match.score_team2,
             },
-            "comparison": {
-                "window": window,
-                "stats_window": stats_window,
-                "team1": team1_payload,
-                "team2": team2_payload,
-                "edge": pre_match_edge(team1_payload, team2_payload),
-            },
+            "comparison": _preview_payload(session, team1, team2, window, stats_window),
         }
 
 

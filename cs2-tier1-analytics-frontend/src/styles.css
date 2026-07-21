@@ -235,6 +235,10 @@ select { min-width: 138px; }
 .edge > strong { margin: 3px 0 6px; font-size: 23px; font-variant-numeric: tabular-nums; }
 .edge > strong em { color: var(--text-3); font-style: normal; }
 .edge-disclaimer { padding: 7px 12px; color: var(--text-2); background: var(--surface-2); border-top: 1px solid var(--border-soft); border-bottom: 1px solid var(--border-soft); font-size: 10px; text-align: center; }
+.coverage-strip { display: grid; grid-template-columns: 1fr 1fr; gap: 1px; background: var(--border-soft); border-bottom: 1px solid var(--border-soft); }
+.coverage-strip > div { min-width: 0; display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 5px 9px; align-items: center; padding: 11px 14px; background: var(--surface); }
+.coverage-strip strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.coverage-strip span { grid-column: 1 / -1; color: var(--text-2); font-size: 11px; }
 .preview-section { padding: 15px; border-bottom: 1px solid var(--border-soft); }
 .preview-section:last-child { border-bottom: 0; }
 .preview-section h3 { margin: 0 0 10px; font-size: 11px; text-transform: uppercase; letter-spacing: .06em; }
@@ -243,12 +247,20 @@ select { min-width: 138px; }
 .comparison-table > div:first-child { color: var(--text-3); background: var(--surface-2); font-size: 9px; text-transform: uppercase; }
 .comparison-table > div:last-child { border-bottom: 0; }
 .comparison-table strong { text-align: right; font-variant-numeric: tabular-nums; }
-.map-compare > div { display: grid; grid-template-columns: 90px 90px 1fr 90px; gap: 10px; align-items: center; min-height: 37px; border-bottom: 1px solid var(--border-soft); }
+.map-compare > div { display: grid; grid-template-columns: 92px 86px 1fr 86px 116px; gap: 10px; align-items: center; min-height: 37px; border-bottom: 1px solid var(--border-soft); }
 .map-compare > div:last-child { border: 0; }
 .map-compare > div > span:first-of-type { text-align: right; }
 .map-compare small { color: var(--text-3); }
 .map-compare i { height: 5px; background: var(--surface-3); border-radius: 4px; overflow: hidden; }
 .map-compare i em { display: block; height: 100%; background: var(--accent); border-radius: 4px; }
+.player-compare { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.player-compare > div { min-width: 0; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
+.player-compare > div > strong { display: block; padding: 8px 10px; background: var(--surface-2); border-bottom: 1px solid var(--border); font-size: 12px; }
+.player-compare span { min-height: 36px; display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; align-items: center; padding: 7px 10px; border-bottom: 1px solid var(--border-soft); }
+.player-compare span:last-child { border-bottom: 0; }
+.player-compare em { min-width: 0; overflow: hidden; text-overflow: ellipsis; font-style: normal; font-weight: 800; white-space: nowrap; }
+.player-compare small, .player-compare p { color: var(--text-2); font-size: 11px; }
+.player-compare p { margin: 0; padding: 18px 10px; }
 
 .data-status-strip { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); margin-bottom: 16px; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); }
 .data-status-strip > div { min-height: 52px; display: flex; flex-direction: column; justify-content: center; padding: 7px 13px; border-right: 1px solid var(--border-soft); }
@@ -324,6 +336,9 @@ select { min-width: 138px; }
   .versus-head > div:first-child, .versus-head > div:last-child { justify-content: center; }
   .versus-head > div:last-child { flex-direction: row; }
   .versus-head .edge { order: 3; }
+  .coverage-strip, .player-compare { grid-template-columns: 1fr; }
+  .map-compare > div { grid-template-columns: 1fr 80px 1fr 80px; }
+  .map-compare .badge { grid-column: 1 / -1; justify-self: start; }
   .metric-grid, .estimate-grid { grid-template-columns: repeat(2, 1fr); }
   .validation-list > div { grid-template-columns: 70px 1fr; padding: 8px 0; }
   .validation-list span, .validation-list em { grid-column: 2; text-align: left; }

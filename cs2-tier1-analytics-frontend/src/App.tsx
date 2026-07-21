@@ -407,22 +407,46 @@ function MatchPreview({ match, filters }: { match: JsonRecord; filters: typeof i
   const data = asRecord(preview.data);
   const a = asRecord(data.team1 ?? data.team_a ?? match.team1 ?? match.team_a);
   const b = asRecord(data.team2 ?? data.team_b ?? match.team2 ?? match.team_b);
-  const edge = Number(data.edge_score ?? data.edge ?? 8);
+  const edge = Number(data.edge_score ?? data.edge ?? 0);
   const scoreA = Math.max(0, Math.min(100, 50 + edge / 2));
   const scoreB = 100 - scoreA;
-  const confidence = String(data.confidence ?? "medium").toLowerCase();
+  const confidence = String(data.confidence ?? "low").toLowerCase();
   const comparisons = asArray(data.comparison ?? data.metrics, ["comparison", "metrics", "items"]);
   const maps = asArray(data.map_pool ?? data.maps, ["maps", "items"]);
+  const coverage = asRecord(data.coverage);
+  const coverageA = asRecord(coverage.team1);
+  const coverageB = asRecord(coverage.team2);
+  const warnings = Array.isArray(coverage.warnings) ? coverage.warnings.map(String) : [];
+  const playerForm = asRecord(data.player_form);
+  const playersA = asArray(playerForm.team1, ["team1", "players"]);
+  const playersB = asArray(playerForm.team2, ["team2", "players"]);
+  const metricValue = (row: JsonRecord, key: string) => {
+    const unit = String(row.unit ?? "");
+    const value = row[key];
+    return unit.includes("percent") ? formatPercent(value) : formatNumber(value, unit === "number" ? 2 : 1);
+  };
+  const barWidth = (value: unknown) => {
+    let n = Number(value);
+    if (!Number.isFinite(n)) return 0;
+    if (Math.abs(n) <= 1) n *= 100;
+    return Math.max(0, Math.min(100, n));
+  };
   return <Panel title="Match preview" meta={`${String(match.event_name ?? match.event ?? "Event")} · ${formatDate(match.start_time ?? match.scheduled_at)}`}>
-    {preview.error && <div className="notice warn">Live preview is unavailable. Showing the fixture data and placeholder structure.</div>}
+    {preview.error && <div className="notice warn">Live preview is unavailable. Showing only fixture data.</div>}
     <div className="versus-head">
       <div><TeamMark name={getName(a, "Team A")} /><strong>{getName(a, "Team A")}</strong><Form value={a.form} /></div>
       <div className="edge"><span>Rule-based edge</span><strong>{scoreA.toFixed(0)} <em>:</em> {scoreB.toFixed(0)}</strong><Badge tone={confidence === "high" ? "good" : confidence === "low" ? "warn" : "info"}>{confidence} confidence</Badge></div>
       <div><TeamMark name={getName(b, "Team B")} /><strong>{getName(b, "Team B")}</strong><Form value={b.form} /></div>
     </div>
     <div className="edge-disclaimer">Model score, not a calibrated win probability. Confidence reflects freshness, coverage and sample size.</div>
-    <div className="preview-section"><h3>Core comparison</h3><div className="comparison-table"><div><span>Metric</span><strong>{getName(a, "A")}</strong><strong>{getName(b, "B")}</strong></div>{(comparisons.length ? comparisons : demo.comparison as JsonRecord[]).map((row, index) => { const v1 = Number(row.team1_value ?? row.value1 ?? row.a ?? 0); const v2 = Number(row.team2_value ?? row.value2 ?? row.b ?? 0); return <div key={getId(row, index)}><span>{String(row.label ?? row.metric)}</span><strong className={v1 > v2 ? "positive" : ""}>{String(row.display1 ?? formatNumber(v1, 2))}</strong><strong className={v2 > v1 ? "positive" : ""}>{String(row.display2 ?? formatNumber(v2, 2))}</strong></div>; })}</div></div>
-    <div className="preview-section"><h3>Map pool</h3><div className="map-compare">{(maps.length ? maps : demo.mapComparison as JsonRecord[]).map((map, index) => { const va = Number(map.team1_win_rate ?? map.a ?? 0); const vb = Number(map.team2_win_rate ?? map.b ?? 0); return <div key={getId(map, index)}><strong>{getName(map, String(map.map_name ?? "Map"))}</strong><span>{formatPercent(va)} <small>n={formatNumber(map.team1_sample ?? map.sample_a)}</small></span><i><em style={{ width: `${Math.max(4, va * 100)}%` }} /></i><span>{formatPercent(vb)} <small>n={formatNumber(map.team2_sample ?? map.sample_b)}</small></span></div>; })}</div></div>
+    <div className="coverage-strip">
+      <div><strong>{getName(a, "Team A")}</strong><Badge tone={String(coverageA.level ?? "low") === "high" ? "good" : String(coverageA.level ?? "low") === "medium" ? "info" : "warn"}>{String(coverageA.level ?? "low")}</Badge><span>{formatNumber(coverageA.matches)} matches / {formatNumber(coverageA.maps)} maps / {formatNumber(coverageA.players_with_stats)} players</span></div>
+      <div><strong>{getName(b, "Team B")}</strong><Badge tone={String(coverageB.level ?? "low") === "high" ? "good" : String(coverageB.level ?? "low") === "medium" ? "info" : "warn"}>{String(coverageB.level ?? "low")}</Badge><span>{formatNumber(coverageB.matches)} matches / {formatNumber(coverageB.maps)} maps / {formatNumber(coverageB.players_with_stats)} players</span></div>
+    </div>
+    {warnings.length > 0 && <div className="notice warn"><strong>Data coverage:</strong> {warnings.join("; ")}</div>}
+    <div className="preview-section"><h3>Core comparison</h3>{comparisons.length ? <div className="comparison-table"><div><span>Metric</span><strong>{getName(a, "A")}</strong><strong>{getName(b, "B")}</strong></div>{comparisons.map((row, index) => { const v1 = Number(row.team1_value ?? row.value1 ?? row.a); const v2 = Number(row.team2_value ?? row.value2 ?? row.b); return <div key={getId(row, index)}><span>{String(row.label ?? row.metric)}</span><strong className={v1 > v2 ? "positive" : ""}>{String(row.display1 ?? metricValue(row, "team1_value"))}</strong><strong className={v2 > v1 ? "positive" : ""}>{String(row.display2 ?? metricValue(row, "team2_value"))}</strong></div>; })}</div> : <div className="empty-small">Not enough saved data for this comparison yet.</div>}</div>
+    <div className="preview-section"><h3>Map pool</h3>{maps.length ? <div className="map-compare">{maps.map((map, index) => { const va = map.team1_win_rate ?? map.a; const vb = map.team2_win_rate ?? map.b; return <div key={getId(map, index)}><strong>{getName(map, String(map.map_name ?? map.map ?? "Map"))}</strong><span>{formatPercent(va)} <small>n={formatNumber(map.team1_sample ?? map.sample_a)}</small></span><i><em style={{ width: `${barWidth(va)}%` }} /></i><span>{formatPercent(vb)} <small>n={formatNumber(map.team2_sample ?? map.sample_b)}</small></span><Badge tone={String(map.state ?? "").includes("insufficient") ? "warn" : "neutral"}>{String(map.state ?? "ready")}</Badge></div>; })}</div> : <div className="empty-small">No saved map pool data for these teams yet.</div>}</div>
+    <div className="preview-section"><h3>Player form</h3><div className="player-compare"><div><strong>{getName(a, "Team A")}</strong>{playersA.length ? playersA.map((player, index) => <span key={getId(player, index)}><em>{String(player.nickname ?? player.player ?? "Player")}</em><small>K/D {formatNumber(player.kd_ratio, 2)} / ADR {formatNumber(player.adr, 1)} / {formatNumber(player.maps)} maps</small></span>) : <p>No player stats saved.</p>}</div><div><strong>{getName(b, "Team B")}</strong>{playersB.length ? playersB.map((player, index) => <span key={getId(player, index)}><em>{String(player.nickname ?? player.player ?? "Player")}</em><small>K/D {formatNumber(player.kd_ratio, 2)} / ADR {formatNumber(player.adr, 1)} / {formatNumber(player.maps)} maps</small></span>) : <p>No player stats saved.</p>}</div></div></div>
   </Panel>;
 }
 

@@ -198,12 +198,16 @@ function normalizeCompare(payload: unknown): JsonRecord {
   const team1 = normalizeTeamRow(root.team1);
   const team2 = normalizeTeamRow(root.team2);
   const edge = asRecord(root.edge);
+  const backendMetrics = asArray(root.metrics, ["metrics", "items"]);
   return {
     ...root,
     team1,
     team2,
-    metrics: metricRows(team1, team2),
-    edge_score: edge.score ?? edge.edge_score,
+    metrics: backendMetrics.length ? backendMetrics : metricRows(team1, team2),
+    map_pool: asArray(root.map_pool, ["map_pool", "maps", "items"]),
+    player_form: root.player_form,
+    coverage: root.coverage,
+    edge_score: edge.edge ?? edge.score ?? edge.edge_score,
     confidence: edge.confidence,
   };
 }
@@ -216,9 +220,12 @@ function normalizePreview(payload: unknown): JsonRecord {
   return {
     ...match,
     ...comparison,
-    edge_score: comparison.edge_score ?? edge.score,
+    edge_score: comparison.edge_score ?? edge.edge ?? edge.score,
     confidence: comparison.confidence ?? edge.confidence,
     comparison: comparison.metrics,
+    map_pool: comparison.map_pool,
+    player_form: comparison.player_form,
+    coverage: comparison.coverage,
   };
 }
 
