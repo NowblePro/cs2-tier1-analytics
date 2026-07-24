@@ -18,6 +18,7 @@ def test_canonical_team_key_handles_provider_brand_variants():
     assert canonical_team_key("FUT Esports") == canonical_team_key("FUT")
     assert canonical_team_key("The MongolZ") == canonical_team_key("MongolZ")
     assert canonical_team_key("BetBoom Team") == canonical_team_key("BetBoom")
+    assert canonical_team_key("Pain Gaming") == canonical_team_key("paiN")
 
 
 def test_find_team_by_alias_prefers_hltv_canonical_team():

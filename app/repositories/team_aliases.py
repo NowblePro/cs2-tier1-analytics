@@ -31,6 +31,7 @@ def canonical_team_key(value: str | None) -> str:
         "falconsesports": "falcons",
         "futesports": "fut",
         "g2esports": "g2",
+        "paingaming": "pain",
         "themongolz": "mongolz",
     }
     return aliases.get(key, key)
