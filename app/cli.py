@@ -25,6 +25,7 @@ from app.models.schema import Event, Match, MatchMap, Team
 from app.pandascore import PandaScoreApiError, PandaScoreClient, ingest_past_pandascore_results, ingest_upcoming_pandascore_matches
 from app.repositories import AnalyticsRepository
 from app.repositories.team_aliases import merge_team_aliases
+from app.repositories.team_alias_audit import audit_top_team_aliases, save_alias_audit
 from app.scraping.client import HltvBlockedError, HltvClient
 from app.scraping.match_parser import parse_match
 from app.scraping.ranking_parser import parse_ranking
@@ -101,6 +102,31 @@ def valve_sync_ranking(args: argparse.Namespace) -> None:
         print(str(exc))
     finally:
         logger.info("valve-sync-ranking duration=%.2fs", time.monotonic() - started)
+
+
+def audit_team_aliases(args: argparse.Namespace) -> None:
+    settings = get_settings()
+    Session = get_session_factory(settings)
+    client = None
+    try:
+        if args.pandascore:
+            client = PandaScoreClient(settings)
+        with Session.begin() as session:
+            report = audit_top_team_aliases(
+                session,
+                limit=args.limit,
+                pandascore_client=client,
+                dry_run=args.dry_run,
+            )
+        path = save_alias_audit(report)
+        print_json(report, ensure_ascii=False)
+        print(f"Saved team alias audit to {path}")
+    except (PandaScoreApiError, RuntimeError, ValueError) as exc:
+        logger.error("%s", exc)
+        print(str(exc))
+    finally:
+        if client is not None:
+            client.close()
 
 
 def scrape_match(args: argparse.Namespace) -> None:
@@ -1094,6 +1120,12 @@ def build_parser() -> argparse.ArgumentParser:
     valve_ranking.add_argument("--limit", type=int, choices=range(1, 101), default=100, metavar="1-100")
     valve_ranking.add_argument("--dry-run", action="store_true")
     valve_ranking.set_defaults(func=valve_sync_ranking)
+
+    alias_audit = sub.add_parser("audit-team-aliases")
+    alias_audit.add_argument("--limit", type=int, choices=range(1, 101), default=50, metavar="1-100")
+    alias_audit.add_argument("--pandascore", action="store_true", help="Verify each team through PandaScore search")
+    alias_audit.add_argument("--dry-run", action="store_true", help="Do not save newly confirmed mappings")
+    alias_audit.set_defaults(func=audit_team_aliases)
 
     match = sub.add_parser("scrape-match")
     add_common_flags(match)
