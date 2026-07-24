@@ -26,11 +26,18 @@ def test_parse_saved_hltv_ranking_fixture_if_present():
     if not files:
         return
     dto = parse_ranking(files[0].read_text(encoding="utf-8", errors="ignore"), "https://www.hltv.org/ranking/teams")
-    assert len(dto.teams) == 30
+    assert len(dto.teams) == 100
     assert dto.teams[0].rank == 1
     assert dto.teams[0].hltv_team_id
     assert dto.teams[0].name
-    assert dto.teams[-1].rank == 30
+    assert dto.teams[-1].rank == 100
+
+
+def test_parse_saved_hltv_ranking_respects_limit():
+    path = next(FIXTURES.glob("Counter-Strike Ranking*.html"))
+    dto = parse_ranking(path.read_text(encoding="utf-8", errors="ignore"), "fixture", limit=50)
+    assert len(dto.teams) == 50
+    assert dto.teams[-1].rank == 50
 
 
 def test_parse_match():

@@ -9,6 +9,7 @@ from typing import Any
 import httpx
 
 from app.config import Settings, get_settings
+from app.http_retry import graphql_rate_limit_delay, is_retryable_status, retry_delay
 
 logger = logging.getLogger(__name__)
 
@@ -26,10 +27,20 @@ class GridSeriesSummary:
     teams: list[dict[str, Any]]
     title_id: str | None = None
     workflow_status: str | None = None
+    tournament_id: str | None = None
+    format_name: str | None = None
+    format_shortened: str | None = None
+    product_service_levels: list[dict[str, Any]] | None = None
+    external_links: list[dict[str, Any]] | None = None
 
 
 class GridClient:
-    def __init__(self, settings: Settings | None = None):
+    def __init__(
+        self,
+        settings: Settings | None = None,
+        transport: httpx.BaseTransport | None = None,
+        sleep=time.sleep,
+    ):
         self.settings = settings or get_settings()
         api_key = (self.settings.grid_api_key or "").strip()
         if not api_key:
@@ -51,42 +62,66 @@ class GridClient:
             "content-type": "application/json",
             "user-agent": "cs2-tier1-analytics/0.1",
         }
+        self._transport = transport
+        self._sleep = sleep
         self._client = self._new_http_client()
 
     def _new_http_client(self) -> httpx.Client:
-        return httpx.Client(timeout=self.settings.request_timeout, headers=self._headers)
+        return httpx.Client(
+            timeout=self.settings.request_timeout,
+            headers=self._headers,
+            transport=self._transport,
+        )
 
     def close(self) -> None:
         self._client.close()
 
     def _post(self, url: str, query: str, variables: dict[str, Any]) -> dict[str, Any]:
         min_interval = self._stats_min_request_interval if url == self.stats_url else self._default_min_request_interval
-        response = None
+        attempts = max(0, self.settings.max_retries) + 1
         last_error: httpx.RequestError | None = None
-        for attempt in range(max(1, self.settings.max_retries)):
+        for attempt in range(attempts):
             elapsed = time.monotonic() - self._last_request_at_by_url.get(url, 0.0)
             if elapsed < min_interval:
-                time.sleep(min_interval - elapsed)
+                self._sleep(min_interval - elapsed)
             try:
                 response = self._client.post(url, json={"query": query, "variables": variables})
-                break
             except httpx.RequestError as exc:
                 last_error = exc
-                logger.warning("GRID API request failed on attempt %s/%s: %s", attempt + 1, self.settings.max_retries, exc)
+                logger.warning("GRID API request failed on attempt %s/%s: %s", attempt + 1, attempts, exc)
                 self._last_request_at_by_url[url] = time.monotonic()
                 self._client.close()
                 self._client = self._new_http_client()
-                if attempt + 1 < self.settings.max_retries:
-                    time.sleep(min(10.0, 1.5 * (attempt + 1)))
-        if response is None:
-            raise GridApiError(f"GRID API request failed: {last_error}") from last_error
-        self._last_request_at_by_url[url] = time.monotonic()
-        if response.status_code >= 400:
-            raise GridApiError(f"GRID API returned HTTP {response.status_code}: {response.text[:300]}")
-        payload = response.json()
-        if payload.get("errors"):
-            raise GridApiError(f"GRID API GraphQL errors: {payload['errors']}")
-        return payload["data"]
+                if attempt + 1 < attempts:
+                    self._sleep(retry_delay(attempt))
+                    continue
+                raise GridApiError(f"GRID API request failed: {last_error}") from last_error
+
+            self._last_request_at_by_url[url] = time.monotonic()
+            if is_retryable_status(response.status_code) and attempt + 1 < attempts:
+                delay = retry_delay(attempt, response.headers)
+                logger.warning(
+                    "GRID API returned retryable HTTP %s; retrying in %.1fs",
+                    response.status_code,
+                    delay,
+                )
+                self._sleep(delay)
+                continue
+            if response.status_code >= 400:
+                raise GridApiError(f"GRID API returned HTTP {response.status_code}: {response.text[:300]}")
+
+            payload = response.json()
+            errors = payload.get("errors") or []
+            rate_delay = graphql_rate_limit_delay(errors, attempt)
+            if errors and rate_delay is not None and attempt + 1 < attempts:
+                logger.warning("GRID API rate limit reached; retrying in %.1fs", rate_delay)
+                self._sleep(rate_delay)
+                continue
+            if errors:
+                raise GridApiError(f"GRID API GraphQL errors: {errors}")
+            return payload["data"]
+
+        raise GridApiError(f"GRID API request failed: {last_error}") from last_error
 
     def list_series(
         self,
@@ -119,6 +154,9 @@ class GridClient:
                 title { id name }
                 teams { baseInfo { id name } }
                 tournament { id name }
+                format { id name nameShortened }
+                productServiceLevels { productName serviceLevel }
+                externalLinks { dataProvider { name } externalEntity { id } }
               }
             }
             pageInfo { endCursor hasNextPage }
@@ -147,6 +185,11 @@ class GridClient:
                 teams=edge["node"].get("teams") or [],
                 title_id=(edge["node"].get("title") or {}).get("id"),
                 workflow_status=edge["node"].get("workflowStatus"),
+                tournament_id=(edge["node"].get("tournament") or {}).get("id"),
+                format_name=(edge["node"].get("format") or {}).get("name"),
+                format_shortened=(edge["node"].get("format") or {}).get("nameShortened"),
+                product_service_levels=edge["node"].get("productServiceLevels") or [],
+                external_links=edge["node"].get("externalLinks") or [],
             )
             for edge in series["edges"]
         ]
@@ -354,28 +397,6 @@ class GridClient:
         """
 
     def query_type_fields(self, endpoint: str, type_name: str = "Query") -> list[dict[str, Any]]:
-        url = self._endpoint_url(endpoint)
-        query = """
-        query TypeFields($name: String!) {
-          __type(name: $name) {
-            name
-            kind
-            fields {
-              name
-              args { name type { kind name ofType { kind name ofType { kind name } } } }
-              type { kind name ofType { kind name ofType { kind name } } }
-            }
-            inputFields {
-              name
-              defaultValue
-              type { kind name ofType { kind name ofType { kind name } } }
-            }
-            enumValues {
-              name
-            }
-          }
-        }
-        """
         type_info = self.schema_type_info(endpoint, type_name)
         if not type_info:
             return []

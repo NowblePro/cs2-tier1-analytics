@@ -4,7 +4,7 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 
 from app.grid.client import GridSeriesSummary
-from app.grid.ingest import _series_is_cs2, grid_state_to_match, ingest_recent_grid_series, save_grid_identity_maps, save_raw_grid_state
+from app.grid.ingest import _series_is_cs2, grid_state_to_match, ingest_grid_history_for_team_ids, ingest_recent_grid_series, normalize_map_name, save_grid_identity_maps, save_raw_grid_state
 from app.models.schema import Base, GridEntityMap, GridRawSeriesState, Match, RankingSnapshot, RankingSnapshotTeam, Team
 
 
@@ -15,7 +15,7 @@ def session_factory():
 
 
 class FakeGridClient:
-    def list_series(self, date_from, date_to, first=50, after=None):
+    def list_series(self, date_from, date_to, first=50, after=None, team_ids=None):
         return (
             [
                 GridSeriesSummary(
@@ -27,6 +27,8 @@ class FakeGridClient:
                         {"baseInfo": {"id": "grid-team-falcons", "name": "Falcons"}},
                         {"baseInfo": {"id": "grid-team-other", "name": "Other Team"}},
                     ],
+                    format_name="best-of-3",
+                    format_shortened="Bo3",
                 )
             ],
             {"hasNextPage": False, "endCursor": None},
@@ -92,6 +94,7 @@ def test_grid_state_maps_to_match_dto():
         summary, _ = FakeGridClient().list_series(datetime(2026, 7, 17), datetime(2026, 7, 18))
         dto = grid_state_to_match(summary[0], FakeGridClient().series_state("series-1"), session)
     assert dto.status == "completed"
+    assert dto.best_of == 3
     assert dto.team1.name == "Falcons"
     assert dto.maps[0].name == "Mirage"
     assert dto.maps[0].score_team1 == 13
@@ -133,8 +136,14 @@ def test_grid_empty_finished_state_is_not_completed_without_winner():
     }
     with Session() as session:
         dto = grid_state_to_match(summary, state, session)
-    assert dto.status == "scheduled"
+    assert dto.status == "finished_unknown"
     assert dto.winner_hltv_team_id is None
+
+
+def test_grid_default_map_names_are_normalized():
+    assert normalize_map_name("default-ancient") == "Ancient"
+    assert normalize_map_name("default-dust2") == "Dust2"
+    assert normalize_map_name("default-unknown") == "GRID Unknown"
 
 
 def test_ingest_recent_grid_series_filters_top30_and_saves():
@@ -147,6 +156,69 @@ def test_ingest_recent_grid_series_filters_top30_and_saves():
         assert len(session.scalars(select(Match)).all()) == 1
         assert session.scalar(select(GridEntityMap).where(GridEntityMap.entity_type == "series", GridEntityMap.grid_id == "series-1")) is not None
         assert session.scalar(select(GridEntityMap).where(GridEntityMap.entity_type == "player", GridEntityMap.grid_id == "p1")) is not None
+
+
+def test_ingest_recent_matches_team_prefix_alias():
+    class TeamPrefixClient(FakeGridClient):
+        def list_series(self, *args, **kwargs):
+            summaries, page_info = super().list_series(*args, **kwargs)
+            summaries[0].teams[0]["baseInfo"]["name"] = "Team Falcons"
+            return summaries, page_info
+
+    Session = session_factory()
+    with Session.begin() as session:
+        add_ranking(session)
+        result = ingest_recent_grid_series(session, TeamPrefixClient(), datetime(2026, 7, 17), datetime(2026, 7, 18), max_pages=1, max_matches=5)
+    assert result["saved"] == 1
+
+
+def test_ingest_recent_can_be_cancelled_before_request():
+    Session = session_factory()
+    client = FakeGridClient()
+    with Session.begin() as session:
+        add_ranking(session)
+        result = ingest_recent_grid_series(session, client, datetime(2026, 7, 17), datetime(2026, 7, 18), max_pages=1, max_matches=5, should_cancel=lambda: True)
+    assert result["cancelled"] is True
+    assert result["pages"] == 0
+
+
+def test_ingest_recent_grid_series_reports_progress_inside_page():
+    Session = session_factory()
+    updates = []
+    with Session.begin() as session:
+        add_ranking(session)
+        ingest_recent_grid_series(
+            session,
+            FakeGridClient(),
+            datetime(2026, 7, 17),
+            datetime(2026, 7, 18),
+            max_pages=1,
+            max_matches=5,
+            progress=updates.append,
+        )
+    assert updates[-1]["current_series_id"] == "series-1"
+    assert updates[-1]["checked"] == 1
+    assert updates[-1]["saved"] == 1
+
+
+def test_team_history_skips_already_completed_matches():
+    Session = session_factory()
+    client = FakeGridClient()
+    with Session.begin() as session:
+        add_ranking(session)
+        ingest_recent_grid_series(session, client, datetime(2026, 7, 17), datetime(2026, 7, 18), max_pages=1, max_matches=5)
+    with Session.begin() as session:
+        result = ingest_grid_history_for_team_ids(
+            session,
+            client,
+            {"grid-team-falcons"},
+            datetime(2026, 7, 17),
+            datetime(2026, 7, 18),
+            max_pages=1,
+            max_matches=5,
+        )
+    assert result["saved"] == 0
+    assert result["skipped_existing"] == 1
 
 
 def test_save_raw_grid_state_deduplicates_by_payload_hash():

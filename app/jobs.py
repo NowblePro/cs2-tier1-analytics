@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -12,6 +12,7 @@ from app.grid.client import GridClient
 from app.grid.stats import refresh_grid_stats
 from app.metrics import compute_metrics
 from app.models.schema import JobRun
+from app.quality import normalize_saved_map_names
 from app.repositories.team_aliases import merge_team_aliases
 from app.validation import validate_data
 
@@ -87,10 +88,23 @@ def run_post_sync_pipeline(
     stats_limit: int = 50,
     validate_report_dir: Path = Path("data/reports"),
     refresh_stats_enabled: bool = True,
+    progress: Callable[[dict[str, Any]], None] | None = None,
+    should_cancel: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     result: dict[str, Any] = {}
+    if progress:
+        progress({"stage": "maps", "progress_percent": 0})
+    result["map_names"] = normalize_saved_map_names(session, dry_run=False)
+    if progress:
+        progress({"stage": "aliases", "progress_percent": 0})
     result["team_aliases"] = merge_team_aliases(session, dry_run=False)
+    if should_cancel and should_cancel():
+        return {**result, "cancelled": True}
+    if progress:
+        progress({"stage": "metrics", "progress_percent": 0})
     result["metrics"] = {"teams": compute_metrics(session)}
+    if should_cancel and should_cancel():
+        return {**result, "cancelled": True}
     if refresh_stats_enabled and client is not None:
         result["stats_refresh"] = refresh_grid_stats(
             session=session,
@@ -99,8 +113,16 @@ def run_post_sync_pipeline(
             window_name=stats_window,
             limit=stats_limit,
             dry_run=False,
+            progress=progress,
+            should_cancel=should_cancel,
         )
+    if should_cancel and should_cancel():
+        return {**result, "cancelled": True}
+    if progress:
+        progress({"stage": "validation", "progress_percent": 0})
     output = validate_report_dir / f"validation-{datetime.now(UTC).strftime('%Y%m%d%H%M%S')}.json"
     result["validation"] = validate_data(session, output)
     result["validation_report"] = str(output)
+    if progress:
+        progress({"stage": "validation", "progress_percent": 100})
     return result

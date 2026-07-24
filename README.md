@@ -190,6 +190,29 @@ python -m uvicorn app.web.main:app --reload --host 127.0.0.1 --port 8011
 
 Open `http://127.0.0.1:8011`.
 
+Operational probes:
+
+```text
+http://127.0.0.1:8011/healthz
+http://127.0.0.1:8011/readyz
+```
+
+`healthz` reports that the process is running. `readyz` additionally verifies the database connection.
+
+Run PostgreSQL, migrations, the API, and the compiled frontend together:
+
+```powershell
+docker compose up --build -d
+docker compose ps
+```
+
+The Compose web port defaults to `8011`. Override it without editing the file:
+
+```powershell
+$env:WEB_PORT="8012"
+docker compose up --build -d
+```
+
 The dashboard can:
 
 - show a compact Analytics/Data Operations UI with Dashboard, Teams, Matches, Upcoming, and Data sections;
@@ -217,6 +240,46 @@ npm run dev
 ```
 
 Vite proxies `/api` to `http://127.0.0.1:8011` by default. If your backend runs on another port, set `VITE_API_BASE_URL` or update `vite.config.ts`.
+
+## Demo Round Parsing
+
+Round-level historical data is not consistently available in the current GRID Open Access responses. For that gap the project has an optional `awpy` integration that parses local CS2 `.dem` replay files.
+
+Install the optional parser dependency:
+
+```powershell
+pip install -e ".[demo]"
+```
+
+Put downloaded replay files under `data/demos/` or pass any local path. Real demo files are ignored by Git.
+
+Inspect a demo without writing to the database:
+
+```powershell
+python -m app.cli demo-inspect --demo-file data\demos\example.dem
+```
+
+Import rounds into an existing saved match map:
+
+```powershell
+python -m app.cli demo-import --demo-file data\demos\example.dem --match-id 1 --match-key local --map-number 1
+```
+
+Use `--match-key hltv` when the id is the external HLTV-style match id saved in `matches.hltv_match_id`. Add `--dry-run` first to preview what the demo contains. Add `--import-player-stats` only when you accept that players may initially be linked by SteamID without a known team until a roster mapping is added.
+
+Demo sources are a separate problem from parsing. The safe pipeline is: use APIs for match metadata, then import legally available `.dem` files when a provider, tournament page, FACEIT, CS2Stats, or manual download gives a direct replay file. The project should not try to bypass HLTV/browser protection.
+
+## Quality Checks
+
+Run the same checks used by GitHub Actions:
+
+```powershell
+ruff check app tests
+pytest -q
+cd cs2-tier1-analytics-frontend
+npm ci
+npm run build
+```
 
 UI redesign prompt for a separate design pass:
 

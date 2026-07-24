@@ -11,6 +11,8 @@ from pathlib import Path
 from app.config import get_settings
 from app.analytics import estimate_backfill
 from app.db import get_session_factory
+from app.demos import AwpyUnavailableError, import_demo_to_match_map, inspect_demo_file
+from app.dust2 import Dust2Client, Dust2FetchError, import_dust2_match, parse_dust2_match, resolve_dust2_match
 from app.logging import configure_logging
 from app.grid import GridClient, ingest_recent_grid_series, ingest_upcoming_grid_series, refresh_live_grid_matches, run_grid_backfill, run_grid_update_since_cursor
 from app.grid.ingest import _series_is_cs2, grid_state_to_match, latest_top_team_names, normalize_name, save_grid_identity_maps, save_raw_grid_state
@@ -20,12 +22,16 @@ from app.jobs import run_post_sync_pipeline
 from app.metrics import compute_metrics
 from app.models import Base
 from app.models.schema import Event, Match, MatchMap, Team
+from app.pandascore import PandaScoreApiError, PandaScoreClient, ingest_past_pandascore_results, ingest_upcoming_pandascore_matches
 from app.repositories import AnalyticsRepository
 from app.repositories.team_aliases import merge_team_aliases
 from app.scraping.client import HltvBlockedError, HltvClient
 from app.scraping.match_parser import parse_match
 from app.scraping.ranking_parser import parse_ranking
 from app.validation import validate_data
+from app.valve_vrs import ValveVrsApiError, ValveVrsClient, ingest_latest_valve_ranking
+from app.update_all import run_update_all
+from app.backup import create_database_backup, export_analytics_data
 
 logger = logging.getLogger(__name__)
 
@@ -66,8 +72,8 @@ def scrape_ranking(args: argparse.Namespace) -> None:
         if args.dry_run:
             print("Dry run: would fetch and parse HLTV ranking")
             return
-        snapshot = parse_ranking(html, source_url)
-        snapshot.teams[:] = snapshot.teams[: settings.top_teams_limit]
+        limit = min(100, args.limit or settings.top_teams_limit)
+        snapshot = parse_ranking(html, source_url, limit=limit)
         with Session.begin() as session:
             repo = AnalyticsRepository(session)
             repo.save_ranking_snapshot(snapshot)
@@ -78,6 +84,23 @@ def scrape_ranking(args: argparse.Namespace) -> None:
     finally:
         client.close()
         logger.info("scrape-ranking pages=%s skipped=%s blocked=%s duration=%.2fs", client.pages_requested, client.skipped_pages, client.blocked_count, time.monotonic() - started)
+
+
+def valve_sync_ranking(args: argparse.Namespace) -> None:
+    settings = get_settings()
+    Session = get_session_factory(settings)
+    Base.metadata.create_all(Session.kw["bind"])
+    started = time.monotonic()
+    try:
+        with ValveVrsClient(settings) as client:
+            with Session.begin() as session:
+                result = ingest_latest_valve_ranking(session, client, limit=args.limit, dry_run=args.dry_run)
+        print_json(result, ensure_ascii=False)
+    except (ValveVrsApiError, RuntimeError, ValueError) as exc:
+        logger.error("%s", exc)
+        print(str(exc))
+    finally:
+        logger.info("valve-sync-ranking duration=%.2fs", time.monotonic() - started)
 
 
 def scrape_match(args: argparse.Namespace) -> None:
@@ -267,6 +290,107 @@ def grid_sync_upcoming(args: argparse.Namespace) -> None:
     finally:
         client.close()
         logger.info("grid-sync-upcoming duration=%.2fs", time.monotonic() - started)
+
+
+def pandascore_sync_upcoming(args: argparse.Namespace) -> None:
+    settings = get_settings()
+    Session = get_session_factory(settings)
+    Base.metadata.create_all(Session.kw["bind"])
+    date_from = _parse_cli_datetime(args.date_from) if args.date_from else datetime.now(UTC).replace(tzinfo=None)
+    date_to = _parse_cli_datetime(args.date_to) if args.date_to else date_from + timedelta(days=args.days)
+    started = time.monotonic()
+    try:
+        with PandaScoreClient(settings) as client:
+            with Session.begin() as session:
+                result = ingest_upcoming_pandascore_matches(
+                    session=session,
+                    client=client,
+                    date_from=date_from,
+                    date_to=date_to,
+                    max_pages=args.max_pages,
+                    max_matches=args.max_matches,
+                    top_limit=args.top_limit,
+                    dry_run=args.dry_run,
+                )
+        print_json(result, ensure_ascii=False)
+    except (PandaScoreApiError, RuntimeError, ValueError) as exc:
+        logger.error("%s", exc)
+        print(str(exc))
+    finally:
+        logger.info("pandascore-sync-upcoming duration=%.2fs", time.monotonic() - started)
+
+
+def pandascore_update_results(args: argparse.Namespace) -> None:
+    settings = get_settings()
+    Session = get_session_factory(settings)
+    Base.metadata.create_all(Session.kw["bind"])
+    date_to = _parse_cli_datetime(args.date_to) if args.date_to else datetime.now(UTC).replace(tzinfo=None)
+    date_from = _parse_cli_datetime(args.date_from) if args.date_from else date_to - timedelta(days=args.days)
+    started = time.monotonic()
+    try:
+        with PandaScoreClient(settings) as client:
+            with Session.begin() as session:
+                result = ingest_past_pandascore_results(
+                    session=session,
+                    client=client,
+                    date_from=date_from,
+                    date_to=date_to,
+                    max_pages=args.max_pages,
+                    max_matches=args.max_matches,
+                    top_limit=args.top_limit,
+                    dry_run=args.dry_run,
+                )
+                if not args.dry_run:
+                    compute_metrics(session)
+        print_json(result, ensure_ascii=False)
+    except (PandaScoreApiError, RuntimeError, ValueError) as exc:
+        logger.error("%s", exc)
+        print(str(exc))
+    finally:
+        logger.info("pandascore-update-results duration=%.2fs", time.monotonic() - started)
+
+
+def update_all(args: argparse.Namespace) -> None:
+    settings = get_settings()
+    Session = get_session_factory(settings)
+    Base.metadata.create_all(Session.kw["bind"])
+    started = time.monotonic()
+    try:
+        with ValveVrsClient(settings) as valve_client, PandaScoreClient(settings) as pandascore_client:
+            grid_client = GridClient(settings)
+            try:
+                with Session.begin() as session:
+                    result = run_update_all(
+                        session,
+                        valve_client=valve_client,
+                        pandascore_client=pandascore_client,
+                        grid_client=grid_client,
+                        top_limit=args.top_limit,
+                        upcoming_days=args.upcoming_days,
+                        results_days=args.results_days,
+                        max_matches=args.max_matches,
+                        dry_run=args.dry_run,
+                        refresh_stats=not args.no_stats,
+                    )
+            finally:
+                grid_client.close()
+        print_json(result, ensure_ascii=False)
+    except (GridApiError, PandaScoreApiError, ValveVrsApiError, RuntimeError, ValueError) as exc:
+        logger.error("%s", exc)
+        print(str(exc))
+    finally:
+        logger.info("update-all duration=%.2fs", time.monotonic() - started)
+
+
+def backup_database(_args: argparse.Namespace) -> None:
+    print_json(create_database_backup(get_settings()), ensure_ascii=False)
+
+
+def export_data(_args: argparse.Namespace) -> None:
+    settings = get_settings()
+    Session = get_session_factory(settings)
+    with Session() as session:
+        print_json(export_analytics_data(session), ensure_ascii=False)
 
 
 def grid_probe_upcoming(args: argparse.Namespace) -> None:
@@ -596,6 +720,145 @@ def run_validate_data(args: argparse.Namespace) -> None:
     print(f"Saved validation report to {output}")
 
 
+def demo_inspect(args: argparse.Namespace) -> None:
+    output = Path(args.output) if args.output else None
+    try:
+        report = inspect_demo_file(args.demo_file, sample_rows=args.sample_rows)
+        if output:
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text(json.dumps(report, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
+            print(f"Saved demo inspection report to {output}")
+        print_json(report, ensure_ascii=False)
+    except (AwpyUnavailableError, FileNotFoundError, RuntimeError, ValueError) as exc:
+        logger.error("%s", exc)
+        print(str(exc))
+
+
+def demo_import(args: argparse.Namespace) -> None:
+    settings = get_settings()
+    Session = get_session_factory(settings)
+    Base.metadata.create_all(Session.kw["bind"])
+    started = time.monotonic()
+    try:
+        if args.dry_run:
+            report = inspect_demo_file(args.demo_file, sample_rows=2)
+            print_json(
+                {
+                    "dry_run": True,
+                    "target": {"match_id": args.match_id, "match_key": args.match_key, "map_number": args.map_number},
+                    "demo": {
+                        "map_name": report["map_name"],
+                        "counts": report["counts"],
+                        "round_summary": report["round_summary"],
+                        "player_totals_sample": report["player_totals"][:10],
+                    },
+                },
+                ensure_ascii=False,
+            )
+            return
+        with Session.begin() as session:
+            result = import_demo_to_match_map(
+                session,
+                args.demo_file,
+                match_id=args.match_id,
+                map_number=args.map_number,
+                match_key=args.match_key,
+                replace_rounds=not args.keep_existing_rounds,
+                import_player_stats=args.import_player_stats,
+            )
+        print_json(result.as_dict(), ensure_ascii=False)
+    except (AwpyUnavailableError, FileNotFoundError, RuntimeError, ValueError) as exc:
+        logger.error("%s", exc)
+        print(str(exc))
+    finally:
+        logger.info("demo-import duration=%.2fs", time.monotonic() - started)
+
+
+def dust2_inspect_match(args: argparse.Namespace) -> None:
+    started = time.monotonic()
+    try:
+        if args.html_file:
+            html = Path(args.html_file).read_text(encoding="utf-8", errors="ignore")
+        else:
+            with Dust2Client(get_settings()) as client:
+                html = client.fetch_match(args.url)
+        parsed = parse_dust2_match(html)
+        print_json(parsed.summary(), ensure_ascii=False)
+    except (Dust2FetchError, FileNotFoundError, RuntimeError, ValueError) as exc:
+        logger.error("%s", exc)
+        print(str(exc))
+    finally:
+        logger.info("dust2-inspect-match duration=%.2fs", time.monotonic() - started)
+
+
+def dust2_import_match(args: argparse.Namespace) -> None:
+    settings = get_settings()
+    Session = get_session_factory(settings)
+    Base.metadata.create_all(Session.kw["bind"])
+    started = time.monotonic()
+    try:
+        if args.html_file:
+            html = Path(args.html_file).read_text(encoding="utf-8", errors="ignore")
+            url = args.url
+        else:
+            if not args.url:
+                raise ValueError("--url is required when --html-file is not provided")
+            with Dust2Client(settings) as client:
+                html = client.fetch_match(args.url)
+            url = args.url
+        if args.dry_run:
+            print_json(parse_dust2_match(html).summary(), ensure_ascii=False)
+            return
+        with Session.begin() as session:
+            result = import_dust2_match(session, html, match_id=args.local_match_id, url=url, import_player_stats=args.import_player_stats)
+            compute_metrics(session)
+        print_json(result.as_dict(), ensure_ascii=False)
+    except (Dust2FetchError, FileNotFoundError, RuntimeError, ValueError) as exc:
+        logger.error("%s", exc)
+        print(str(exc))
+    finally:
+        logger.info("dust2-import-match duration=%.2fs", time.monotonic() - started)
+
+
+def dust2_resolve_match(args: argparse.Namespace) -> None:
+    settings = get_settings()
+    Session = get_session_factory(settings)
+    started = time.monotonic()
+    try:
+        with Dust2Client(settings) as client:
+            with Session.begin() as session:
+                candidates = resolve_dust2_match(session, client, args.local_match_id, max_candidates=args.max_candidates)
+                best = candidates[0] if candidates else None
+                imported = None
+                if args.import_best:
+                    if best is None or best.score < args.min_score or best.parsed is None:
+                        raise ValueError(f"No Dust2 candidate reached min score {args.min_score}")
+                    html = client.fetch_match(best.url)
+                    result = import_dust2_match(
+                        session,
+                        html,
+                        match_id=args.local_match_id,
+                        url=best.url,
+                        import_player_stats=args.import_player_stats,
+                    )
+                    compute_metrics(session)
+                    imported = result.as_dict()
+        print_json(
+            {
+                "local_match_id": args.local_match_id,
+                "best": best.as_dict() if best else None,
+                "candidates": [item.as_dict() for item in candidates],
+                "imported": imported,
+            },
+            ensure_ascii=False,
+        )
+    except (Dust2FetchError, RuntimeError, ValueError) as exc:
+        logger.error("%s", exc)
+        print(str(exc))
+    finally:
+        logger.info("dust2-resolve-match duration=%.2fs", time.monotonic() - started)
+
+
 def normalize_grid_maps(_: argparse.Namespace) -> None:
     Session = get_session_factory()
     with Session.begin() as session:
@@ -824,7 +1087,13 @@ def build_parser() -> argparse.ArgumentParser:
     ranking = sub.add_parser("scrape-ranking")
     add_common_flags(ranking)
     ranking.add_argument("--html-file", default=None, help="Parse a saved ranking HTML file instead of fetching")
+    ranking.add_argument("--limit", type=int, choices=range(1, 101), default=None, metavar="1-100")
     ranking.set_defaults(func=scrape_ranking)
+
+    valve_ranking = sub.add_parser("valve-sync-ranking")
+    valve_ranking.add_argument("--limit", type=int, choices=range(1, 101), default=100, metavar="1-100")
+    valve_ranking.add_argument("--dry-run", action="store_true")
+    valve_ranking.set_defaults(func=valve_sync_ranking)
 
     match = sub.add_parser("scrape-match")
     add_common_flags(match)
@@ -883,6 +1152,41 @@ def build_parser() -> argparse.ArgumentParser:
     grid_upcoming_parser.add_argument("--dry-run", action="store_true")
     grid_upcoming_parser.set_defaults(func=grid_sync_upcoming)
 
+    pandascore_upcoming_parser = sub.add_parser("pandascore-sync-upcoming")
+    pandascore_upcoming_parser.add_argument("--days", type=int, default=14)
+    pandascore_upcoming_parser.add_argument("--from", dest="date_from", default=None)
+    pandascore_upcoming_parser.add_argument("--to", dest="date_to", default=None)
+    pandascore_upcoming_parser.add_argument("--max-pages", type=int, default=5)
+    pandascore_upcoming_parser.add_argument("--max-matches", type=int, default=500)
+    pandascore_upcoming_parser.add_argument("--top-limit", type=int, default=50)
+    pandascore_upcoming_parser.add_argument("--dry-run", action="store_true")
+    pandascore_upcoming_parser.set_defaults(func=pandascore_sync_upcoming)
+
+    pandascore_results_parser = sub.add_parser("pandascore-update-results")
+    pandascore_results_parser.add_argument("--days", type=int, default=7)
+    pandascore_results_parser.add_argument("--from", dest="date_from", default=None)
+    pandascore_results_parser.add_argument("--to", dest="date_to", default=None)
+    pandascore_results_parser.add_argument("--max-pages", type=int, default=10)
+    pandascore_results_parser.add_argument("--max-matches", type=int, default=500)
+    pandascore_results_parser.add_argument("--top-limit", type=int, default=50)
+    pandascore_results_parser.add_argument("--dry-run", action="store_true")
+    pandascore_results_parser.set_defaults(func=pandascore_update_results)
+
+    update_all_parser = sub.add_parser("update-all")
+    update_all_parser.add_argument("--top-limit", type=int, default=50)
+    update_all_parser.add_argument("--upcoming-days", type=int, default=14)
+    update_all_parser.add_argument("--results-days", type=int, default=7)
+    update_all_parser.add_argument("--max-matches", type=int, default=500)
+    update_all_parser.add_argument("--no-stats", action="store_true")
+    update_all_parser.add_argument("--dry-run", action="store_true")
+    update_all_parser.set_defaults(func=update_all)
+
+    backup_parser = sub.add_parser("backup-db")
+    backup_parser.set_defaults(func=backup_database)
+
+    export_parser = sub.add_parser("export-data")
+    export_parser.set_defaults(func=export_data)
+
     grid_probe_parser = sub.add_parser("grid-probe-upcoming")
     grid_probe_parser.add_argument("--top-limit", type=int, default=50)
     grid_probe_parser.add_argument("--windows", type=int, nargs="+", default=[14, 30, 90])
@@ -935,6 +1239,43 @@ def build_parser() -> argparse.ArgumentParser:
     validate = sub.add_parser("validate-data")
     validate.add_argument("--output", default=f"data/reports/validation-{datetime.now(UTC).strftime('%Y%m%d%H%M%S')}.json")
     validate.set_defaults(func=run_validate_data)
+
+    demo_report = sub.add_parser("demo-inspect")
+    demo_report.add_argument("--demo-file", required=True)
+    demo_report.add_argument("--sample-rows", type=int, default=3)
+    demo_report.add_argument("--output", default=f"data/reports/demo-inspect-{datetime.now(UTC).strftime('%Y%m%d%H%M%S')}.json")
+    demo_report.set_defaults(func=demo_inspect)
+
+    demo_import_parser = sub.add_parser("demo-import")
+    demo_import_parser.add_argument("--demo-file", required=True)
+    demo_import_parser.add_argument("--match-id", type=int, required=True)
+    demo_import_parser.add_argument("--match-key", choices=["local", "hltv"], default="local")
+    demo_import_parser.add_argument("--map-number", type=int, required=True)
+    demo_import_parser.add_argument("--keep-existing-rounds", action="store_true")
+    demo_import_parser.add_argument("--import-player-stats", action="store_true")
+    demo_import_parser.add_argument("--dry-run", action="store_true")
+    demo_import_parser.set_defaults(func=demo_import)
+
+    dust2_inspect_parser = sub.add_parser("dust2-inspect-match")
+    dust2_inspect_parser.add_argument("--url", default=None)
+    dust2_inspect_parser.add_argument("--html-file", default=None)
+    dust2_inspect_parser.set_defaults(func=dust2_inspect_match)
+
+    dust2_import_parser = sub.add_parser("dust2-import-match")
+    dust2_import_parser.add_argument("--url", default=None)
+    dust2_import_parser.add_argument("--html-file", default=None)
+    dust2_import_parser.add_argument("--local-match-id", type=int, required=True)
+    dust2_import_parser.add_argument("--import-player-stats", action="store_true")
+    dust2_import_parser.add_argument("--dry-run", action="store_true")
+    dust2_import_parser.set_defaults(func=dust2_import_match)
+
+    dust2_resolve_parser = sub.add_parser("dust2-resolve-match")
+    dust2_resolve_parser.add_argument("--local-match-id", type=int, required=True)
+    dust2_resolve_parser.add_argument("--max-candidates", type=int, default=8)
+    dust2_resolve_parser.add_argument("--min-score", type=int, default=70)
+    dust2_resolve_parser.add_argument("--import-best", action="store_true")
+    dust2_resolve_parser.add_argument("--import-player-stats", action="store_true")
+    dust2_resolve_parser.set_defaults(func=dust2_resolve_match)
 
     normalize = sub.add_parser("normalize-grid-maps")
     normalize.set_defaults(func=normalize_grid_maps)

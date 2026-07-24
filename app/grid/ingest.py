@@ -5,7 +5,7 @@ import json
 import re
 import logging
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, Callable
 
 from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session
 from app.grid.client import GridApiError, GridClient, GridSeriesSummary
 from app.grid.ids import stable_negative_id
 from app.repositories import AnalyticsRepository
-from app.repositories.team_aliases import find_team_by_alias
+from app.repositories.team_aliases import canonical_team_key, find_team_by_alias
 from app.scraping.dto import MapDTO, MatchDTO, PlayerStatDTO, TeamDTO
 from app.scraping.player_stats_parser import calculate_kd_ratio
 from app.models.schema import Event, GridEntityMap, GridRawSeriesState, Match, Player, RankingSnapshot, RankingSnapshotTeam, Team
@@ -35,6 +35,29 @@ MAP_NAME_ALIASES = {
     "de_cache": "Cache",
     "de_cbble": "Cobblestone",
     "de_cobblestone": "Cobblestone",
+    "d2": "Dust2",
+    "anc": "Ancient",
+    "anb": "Anubis",
+    "inf": "Inferno",
+    "mrg": "Mirage",
+    "ovp": "Overpass",
+    "trn": "Train",
+    "vtg": "Vertigo",
+    "cbble": "Cobblestone",
+}
+KNOWN_MAPS = {
+    "Ancient",
+    "Anubis",
+    "Cache",
+    "Cobblestone",
+    "Dust2",
+    "GRID Unknown",
+    "Inferno",
+    "Mirage",
+    "Nuke",
+    "Overpass",
+    "Train",
+    "Vertigo",
 }
 
 
@@ -49,17 +72,21 @@ def normalize_map_name(value: str | None) -> str:
     if not stripped:
         return "GRID Unknown"
     lowered = stripped.lower().replace("-", "_").replace(" ", "_")
+    if lowered.startswith("default_"):
+        lowered = lowered.removeprefix("default_")
+        if lowered in {"", "unknown"}:
+            return "GRID Unknown"
     if lowered in MAP_NAME_ALIASES:
         return MAP_NAME_ALIASES[lowered]
-    compact = stripped.replace(" ", "")
-    for canonical in ["Ancient", "Anubis", "Cache", "Cobblestone", "Dust2", "Inferno", "Mirage", "Nuke", "Overpass", "Train", "Vertigo"]:
+    compact = lowered.replace("_", "")
+    for canonical in KNOWN_MAPS - {"GRID Unknown"}:
         if compact.lower() == canonical.lower():
             return canonical
     return stripped
 
 
 def latest_top_team_names(session: Session, limit: int = 30) -> set[str]:
-    snapshot = session.scalar(select(RankingSnapshot).order_by(desc(RankingSnapshot.ranking_date), desc(RankingSnapshot.id)).limit(1))
+    snapshot = session.scalar(select(RankingSnapshot).order_by(desc(RankingSnapshot.id)).limit(1))
     if snapshot is None:
         return set()
     rows = session.execute(
@@ -69,7 +96,7 @@ def latest_top_team_names(session: Session, limit: int = 30) -> set[str]:
         .order_by(RankingSnapshotTeam.rank)
         .limit(limit)
     )
-    return {normalize_name(row[0]) for row in rows}
+    return {canonical_team_key(row[0]) for row in rows}
 
 
 def _team_from_grid(team_node: dict[str, Any], session: Session) -> TeamDTO | None:
@@ -142,11 +169,17 @@ def _series_team_grid_ids(summary: GridSeriesSummary) -> list[str]:
     return ids
 
 
+def _series_best_of(summary: GridSeriesSummary) -> int | None:
+    value = summary.format_shortened or summary.format_name or ""
+    match = re.search(r"(?:bo|best[- ]of[- ])\s*(\d+)", value, re.IGNORECASE)
+    return int(match.group(1)) if match else None
+
+
 def _series_involves_top_team(summary: GridSeriesSummary, top_names: set[str]) -> bool:
     if not _series_is_cs2(summary):
         return False
     for name in _series_team_names(summary):
-        if normalize_name(name) in top_names:
+        if canonical_team_key(name) in top_names:
             return True
     return False
 
@@ -155,7 +188,7 @@ def _series_involves_any_team(summary: GridSeriesSummary, team_names: set[str]) 
     if not _series_is_cs2(summary):
         return False
     for name in _series_team_names(summary):
-        if normalize_name(name) in team_names:
+        if canonical_team_key(name) in team_names:
             return True
     return False
 
@@ -174,6 +207,7 @@ def _scheduled_match_from_summary(summary: GridSeriesSummary, session: Session) 
         team2=summary_teams[1],
         winner_hltv_team_id=None,
         event_name=summary.tournament_name,
+        best_of=_series_best_of(summary),
     )
 
 
@@ -343,8 +377,8 @@ def grid_state_to_match(summary: GridSeriesSummary, state: dict[str, Any], sessi
         stats.extend(_player_stats(game, index, session, summary_teams))
 
     status = "scheduled"
-    if state.get("finished") and (winner_id is not None or maps):
-        status = "completed"
+    if state.get("finished"):
+        status = "completed" if winner_id is not None else "finished_unknown"
     elif state.get("started"):
         status = "live"
 
@@ -357,6 +391,7 @@ def grid_state_to_match(summary: GridSeriesSummary, state: dict[str, Any], sessi
         team2=summary_teams[1],
         winner_hltv_team_id=winner_id,
         event_name=summary.tournament_name,
+        best_of=_series_best_of(summary),
         score_team1=state_teams[0].get("score") if len(state_teams) >= 2 else None,
         score_team2=state_teams[1].get("score") if len(state_teams) >= 2 else None,
         maps=maps,
@@ -374,7 +409,10 @@ def ingest_recent_grid_series(
     dry_run: bool = False,
     top_limit: int = 30,
     require_top_team: bool = True,
-) -> dict[str, int]:
+    progress: Callable[[dict[str, Any]], None] | None = None,
+    checkpoint: Callable[[], None] | None = None,
+    should_cancel: Callable[[], bool] | None = None,
+) -> dict[str, Any]:
     top_names = latest_top_team_names(session, top_limit)
     if require_top_team and not top_names:
         raise RuntimeError(f"No top-{top_limit} ranking snapshot found. Load ranking first.")
@@ -382,10 +420,42 @@ def ingest_recent_grid_series(
     page = 0
     after = None
     checked = matched = saved = skipped = errors = 0
+
+    def report(*, current_series_id: str | None = None, page_size: int = 0, page_processed: int = 0, has_next_page: bool = False) -> None:
+        if progress:
+            progress(
+                {
+                    "stage": "series",
+                    "page": page,
+                    "pages_limit": max_pages,
+                    "page_size": page_size,
+                    "page_processed": page_processed,
+                    "has_next_page": has_next_page,
+                    "current_series_id": current_series_id,
+                    "checked": checked,
+                    "matched_top30": matched,
+                    "saved": saved,
+                    "skipped": skipped,
+                    "errors": errors,
+                    "new_matches": repo.new_matches,
+                    "updated_matches": repo.updated_matches,
+                }
+            )
+
+    cancelled = False
+    limit_reached = False
     while page < max_pages and saved < max_matches:
+        if should_cancel and should_cancel():
+            cancelled = True
+            break
         summaries, page_info = client.list_series(date_from, date_to, first=50, after=after)
         page += 1
-        for summary in summaries:
+        has_next_page = bool(page_info.get("hasNextPage"))
+        report(page_size=len(summaries), has_next_page=has_next_page)
+        for page_index, summary in enumerate(summaries, start=1):
+            if should_cancel and should_cancel():
+                cancelled = True
+                break
             checked += 1
             if require_top_team:
                 matched_series = _series_involves_top_team(summary, top_names)
@@ -393,9 +463,11 @@ def ingest_recent_grid_series(
                 matched_series = _series_is_cs2(summary)
             if not matched_series:
                 skipped += 1
+                report(current_series_id=summary.id, page_size=len(summaries), page_processed=page_index, has_next_page=has_next_page)
                 continue
             matched += 1
             if dry_run:
+                report(current_series_id=summary.id, page_size=len(summaries), page_processed=page_index, has_next_page=has_next_page)
                 continue
             try:
                 state = client.series_state(summary.id)
@@ -405,16 +477,22 @@ def ingest_recent_grid_series(
                 logger.warning("Skipping GRID series %s: %s", summary.id, exc)
                 errors += 1
                 skipped += 1
+                report(current_series_id=summary.id, page_size=len(summaries), page_processed=page_index, has_next_page=has_next_page)
                 continue
             if dto is None:
                 skipped += 1
+                report(current_series_id=summary.id, page_size=len(summaries), page_processed=page_index, has_next_page=has_next_page)
                 continue
             repo.save_match(dto)
             save_grid_identity_maps(session, summary, state, dto)
             saved += 1
+            if checkpoint:
+                checkpoint()
+            report(current_series_id=summary.id, page_size=len(summaries), page_processed=page_index, has_next_page=has_next_page)
             if saved >= max_matches:
+                limit_reached = page_index < len(summaries) or has_next_page
                 break
-        if not page_info.get("hasNextPage"):
+        if cancelled or not page_info.get("hasNextPage"):
             break
         after = page_info.get("endCursor")
     return {
@@ -426,6 +504,8 @@ def ingest_recent_grid_series(
         "errors": errors,
         "new_matches": repo.new_matches,
         "updated_matches": repo.updated_matches,
+        "cancelled": cancelled,
+        "limit_reached": limit_reached,
     }
 
 
@@ -439,7 +519,7 @@ def ingest_grid_history_for_team_names(
     max_matches: int,
     dry_run: bool = False,
 ) -> dict[str, int]:
-    normalized_names = {normalize_name(name) for name in team_names if name}
+    normalized_names = {canonical_team_key(name) for name in team_names if name}
     repo = AnalyticsRepository(session)
     page = 0
     after = None
@@ -496,25 +576,42 @@ def ingest_grid_history_for_team_ids(
     max_pages: int,
     max_matches: int,
     dry_run: bool = False,
-) -> dict[str, int]:
+    skip_completed: bool = True,
+    progress: Callable[[dict[str, Any]], None] | None = None,
+    should_cancel: Callable[[], bool] | None = None,
+) -> dict[str, Any]:
     normalized_ids = {str(team_id) for team_id in team_ids if team_id}
     repo = AnalyticsRepository(session)
     page = 0
-    checked = matched = saved = skipped = errors = 0
+    checked = matched = saved = skipped = skipped_existing = errors = 0
+    cancelled = False
     if not normalized_ids:
         return {"pages": 0, "checked": 0, "matched": 0, "saved": 0, "skipped": 0, "errors": 0, "new_matches": 0, "updated_matches": 0}
     for team_id in sorted(normalized_ids):
         after = None
         while page < max_pages and saved < max_matches:
+            if should_cancel and should_cancel():
+                cancelled = True
+                break
             summaries, page_info = client.list_series(date_from, date_to, first=50, after=after, team_ids=[team_id])
             page += 1
-            for summary in summaries:
+            for page_index, summary in enumerate(summaries, start=1):
+                if should_cancel and should_cancel():
+                    cancelled = True
+                    break
                 checked += 1
                 if not _series_is_cs2(summary):
                     skipped += 1
                     continue
                 matched += 1
                 if dry_run:
+                    continue
+                existing = session.scalar(select(Match).where(Match.source_url == f"grid://series/{summary.id}"))
+                if skip_completed and existing is not None and existing.status == "completed":
+                    skipped += 1
+                    skipped_existing += 1
+                    if progress:
+                        progress({"stage": "team-series", "page": page, "pages_limit": max_pages, "page_processed": page_index, "checked": checked, "matched": matched, "saved": saved, "skipped_existing": skipped_existing, "errors": errors, "current_series_id": summary.id})
                     continue
                 try:
                     state = client.series_state(summary.id)
@@ -531,12 +628,14 @@ def ingest_grid_history_for_team_ids(
                 repo.save_match(dto)
                 save_grid_identity_maps(session, summary, state, dto)
                 saved += 1
+                if progress:
+                    progress({"stage": "team-series", "page": page, "pages_limit": max_pages, "page_processed": page_index, "checked": checked, "matched": matched, "saved": saved, "skipped_existing": skipped_existing, "errors": errors, "current_series_id": summary.id})
                 if saved >= max_matches:
                     break
-            if not page_info.get("hasNextPage"):
+            if cancelled or not page_info.get("hasNextPage"):
                 break
             after = page_info.get("endCursor")
-        if page >= max_pages or saved >= max_matches:
+        if cancelled or page >= max_pages or saved >= max_matches:
             break
     return {
         "pages": page,
@@ -544,9 +643,11 @@ def ingest_grid_history_for_team_ids(
         "matched": matched,
         "saved": saved,
         "skipped": skipped,
+        "skipped_existing": skipped_existing,
         "errors": errors,
         "new_matches": repo.new_matches,
         "updated_matches": repo.updated_matches,
+        "cancelled": cancelled,
     }
 
 
@@ -579,13 +680,95 @@ def _local_match_summary(session: Session, match: Match) -> GridSeriesSummary | 
     )
 
 
+def refresh_saved_grid_matches(
+    session: Session,
+    client: GridClient,
+    match_ids: list[int],
+    *,
+    dry_run: bool = False,
+    progress: Callable[[dict[str, Any]], None] | None = None,
+    should_cancel: Callable[[], bool] | None = None,
+) -> dict[str, Any]:
+    repo = AnalyticsRepository(session)
+    matches = session.scalars(
+        select(Match)
+        .where(
+            Match.id.in_(match_ids),
+            Match.source_url.like("grid://series/%"),
+        )
+        .order_by(Match.match_time, Match.id)
+    ).all() if match_ids else []
+    checked = refreshed = skipped = errors = 0
+    cancelled = False
+    for index, match in enumerate(matches, start=1):
+        if should_cancel and should_cancel():
+            cancelled = True
+            break
+        checked += 1
+        summary = _local_match_summary(session, match)
+        if summary is None:
+            skipped += 1
+            continue
+        if progress:
+            progress(
+                {
+                    "stage": "repair",
+                    "current": index,
+                    "total": len(matches),
+                    "match_id": match.id,
+                    "series_id": summary.id,
+                    "refreshed": refreshed,
+                    "errors": errors,
+                    "progress_percent": round((index - 1) / max(len(matches), 1) * 100, 2),
+                }
+            )
+        if dry_run:
+            refreshed += 1
+            continue
+        try:
+            state = client.series_state(summary.id)
+            save_raw_grid_state(session, summary.id, state)
+            dto = grid_state_to_match(summary, state, session)
+            if dto is None:
+                skipped += 1
+                continue
+            repo.save_match(dto)
+            save_grid_identity_maps(session, summary, state, dto)
+            refreshed += 1
+        except GridApiError as exc:
+            logger.warning("Could not repair GRID match %s: %s", match.id, exc)
+            errors += 1
+            skipped += 1
+    if progress:
+        progress(
+            {
+                "stage": "repair",
+                "current": checked,
+                "total": len(matches),
+                "refreshed": refreshed,
+                "errors": errors,
+                "progress_percent": 100,
+            }
+        )
+    return {
+        "checked": checked,
+        "refreshed": refreshed,
+        "skipped": skipped,
+        "errors": errors,
+        "new_matches": repo.new_matches,
+        "updated_matches": repo.updated_matches,
+        "cancelled": cancelled,
+    }
+
+
 def refresh_live_grid_matches(
     session: Session,
     client: GridClient,
     *,
     limit: int = 50,
     dry_run: bool = False,
-) -> dict[str, int]:
+    should_cancel: Callable[[], bool] | None = None,
+) -> dict[str, Any]:
     repo = AnalyticsRepository(session)
     now = datetime.now(UTC).replace(tzinfo=None)
     matches = session.scalars(
@@ -598,7 +781,11 @@ def refresh_live_grid_matches(
         .limit(limit)
     ).all()
     checked = refreshed = skipped = errors = state_errors = completed = 0
+    cancelled = False
     for match in matches:
+        if should_cancel and should_cancel():
+            cancelled = True
+            break
         checked += 1
         summary = _local_match_summary(session, match)
         if summary is None:
@@ -633,6 +820,7 @@ def refresh_live_grid_matches(
         "completed": completed,
         "new_matches": repo.new_matches,
         "updated_matches": repo.updated_matches,
+        "cancelled": cancelled,
     }
 
 
@@ -649,6 +837,7 @@ def ingest_upcoming_grid_series(
     history_days: int = 90,
     history_max_pages: int = 20,
     history_max_matches: int = 200,
+    should_cancel: Callable[[], bool] | None = None,
 ) -> dict[str, object]:
     top_names = latest_top_team_names(session, top_limit)
     if not top_names:
@@ -659,10 +848,17 @@ def ingest_upcoming_grid_series(
     checked = matched = saved = skipped = errors = state_errors = 0
     involved_names: set[str] = set()
     involved_grid_team_ids: set[str] = set()
+    cancelled = False
     while page < max_pages and saved < max_matches:
+        if should_cancel and should_cancel():
+            cancelled = True
+            break
         summaries, page_info = client.list_series(date_from, date_to, first=50, after=after)
         page += 1
         for summary in summaries:
+            if should_cancel and should_cancel():
+                cancelled = True
+                break
             checked += 1
             if not _series_involves_top_team(summary, top_names):
                 skipped += 1
@@ -693,12 +889,12 @@ def ingest_upcoming_grid_series(
             saved += 1
             if saved >= max_matches:
                 break
-        if not page_info.get("hasNextPage"):
+        if cancelled or not page_info.get("hasNextPage"):
             break
         after = page_info.get("endCursor")
 
     history_result: dict[str, int] | None = None
-    if history_days > 0 and involved_names and history_max_matches > 0:
+    if not cancelled and history_days > 0 and involved_names and history_max_matches > 0:
         history_to = date_from
         history_from = history_to - timedelta(days=history_days)
         if involved_grid_team_ids:
@@ -737,4 +933,5 @@ def ingest_upcoming_grid_series(
         "involved_teams": sorted(involved_names),
         "involved_grid_team_ids": sorted(involved_grid_team_ids),
         "history": history_result,
+        "cancelled": cancelled,
     }

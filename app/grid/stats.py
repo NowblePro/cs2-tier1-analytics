@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import logging
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Callable
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -56,7 +56,9 @@ def refresh_grid_stats(
     window_name: str = "LAST_MONTH",
     limit: int = 30,
     dry_run: bool = False,
-) -> dict[str, int]:
+    progress: Callable[[dict[str, Any]], None] | None = None,
+    should_cancel: Callable[[], bool] | None = None,
+) -> dict[str, Any]:
     if entity_type not in {"team", "player"}:
         raise ValueError("entity_type must be 'team' or 'player'")
     if window_name not in VALID_WINDOWS:
@@ -78,7 +80,11 @@ def refresh_grid_stats(
             break
 
     saved = skipped = errors = 0
-    for entity in unique_entities:
+    cancelled = False
+    for index, entity in enumerate(unique_entities, start=1):
+        if should_cancel and should_cancel():
+            cancelled = True
+            break
         if dry_run:
             skipped += 1
             continue
@@ -99,9 +105,14 @@ def refresh_grid_stats(
         except GridApiError as exc:
             logger.warning("Skipping GRID %s stats %s: %s", entity_type, entity.grid_id, exc)
             errors += 1
-    return {
+        if progress:
+            progress({"stage": "stats", "checked": index, "total": len(unique_entities), "saved": saved, "skipped": skipped, "errors": errors, "progress_percent": round(index / max(1, len(unique_entities)) * 100, 2)})
+    result = {
         "checked": len(unique_entities),
         "saved": saved,
         "skipped": skipped,
         "errors": errors,
     }
+    if cancelled:
+        result["cancelled"] = True
+    return result

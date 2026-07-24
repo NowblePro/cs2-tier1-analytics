@@ -1,0 +1,13 @@
+.env
+.git
+.github
+.pytest_cache
+.venv
+__pycache__
+*.pyc
+*.egg-info
+data
+tests
+cs2-tier1-analytics-frontend/dist
+cs2-tier1-analytics-frontend/node_modules
+app/web/static

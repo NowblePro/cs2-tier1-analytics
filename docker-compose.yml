@@ -15,6 +15,21 @@ services:
       timeout: 5s
       retries: 10
 
+  web:
+    build:
+      context: .
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://cs2:cs2@db:5432/cs2
+    ports:
+      - "${WEB_PORT:-8011}:8011"
+    volumes:
+      - ./data:/app/data
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
 volumes:
   postgres_data:
-

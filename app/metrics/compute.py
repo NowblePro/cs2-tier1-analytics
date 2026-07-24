@@ -1,7 +1,13 @@
 from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
-from app.models.schema import Match, MatchMap, PlayerMapStat, Round, Team, TeamRollingMetric
+from app.models.schema import Event, Match, MatchMap, PlayerMapStat, Round, Team, TeamRollingMetric
+
+EXCLUDED_ANALYTICS_EVENTS = {"GRID-TEST"}
+
+
+def _included_event():
+    return Event.name.is_(None) | Event.name.not_in(EXCLUDED_ANALYTICS_EVENTS)
 
 
 def ratio(numerator: int | float | None, denominator: int | float | None) -> float | None:
@@ -15,24 +21,41 @@ def compute_metrics(session: Session) -> int:
     teams = session.scalars(select(Team)).all()
     count = 0
     for team in teams:
-        matches = session.scalars(select(Match).where((Match.team1_id == team.id) | (Match.team2_id == team.id))).all()
+        matches = session.scalars(
+            select(Match)
+            .outerjoin(Event, Match.event_id == Event.id)
+            .where((Match.team1_id == team.id) | (Match.team2_id == team.id), _included_event())
+        ).all()
         completed = [m for m in matches if m.status == "completed"]
         won_matches = sum(1 for m in completed if m.winner_team_id == team.id)
         maps = session.scalars(
-            select(MatchMap).join(Match, MatchMap.match_id == Match.id).where((Match.team1_id == team.id) | (Match.team2_id == team.id))
+            select(MatchMap).join(Match, MatchMap.match_id == Match.id).outerjoin(Event, Match.event_id == Event.id).where((Match.team1_id == team.id) | (Match.team2_id == team.id), _included_event())
         ).all()
         played_maps = [m for m in maps if m.score_team1 is not None and m.score_team2 is not None]
         won_maps = sum(1 for m in played_maps if m.winner_team_id == team.id)
-        stats = session.execute(select(func.sum(PlayerMapStat.kills), func.sum(PlayerMapStat.deaths)).where(PlayerMapStat.team_id == team.id)).one()
-        rounds = session.scalars(select(Round).where(Round.winner_team_id == team.id)).all()
-        team_round_wins = len(rounds)
+        stats = session.execute(
+            select(func.sum(PlayerMapStat.kills), func.sum(PlayerMapStat.deaths))
+            .join(MatchMap, PlayerMapStat.match_map_id == MatchMap.id)
+            .join(Match, MatchMap.match_id == Match.id)
+            .outerjoin(Event, Match.event_id == Event.id)
+            .where(PlayerMapStat.team_id == team.id, _included_event())
+        ).one()
+        rounds = session.scalars(
+            select(Round)
+            .join(MatchMap, Round.match_map_id == MatchMap.id)
+            .join(Match, MatchMap.match_id == Match.id)
+            .outerjoin(Event, Match.event_id == Event.id)
+            .where(Round.winner_team_id == team.id, _included_event())
+        ).all()
         all_rounds = session.scalar(
-            select(func.count(Round.id)).join(MatchMap, Round.match_map_id == MatchMap.id).join(Match, MatchMap.match_id == Match.id).where((Match.team1_id == team.id) | (Match.team2_id == team.id))
+            select(func.count(Round.id)).join(MatchMap, Round.match_map_id == MatchMap.id).join(Match, MatchMap.match_id == Match.id).outerjoin(Event, Match.event_id == Event.id).where((Match.team1_id == team.id) | (Match.team2_id == team.id), _included_event())
         )
         pistol_played = session.scalar(
-            select(func.count(Round.id)).join(MatchMap, Round.match_map_id == MatchMap.id).join(Match, MatchMap.match_id == Match.id).where(Round.is_pistol.is_(True), (Match.team1_id == team.id) | (Match.team2_id == team.id))
+            select(func.count(Round.id)).join(MatchMap, Round.match_map_id == MatchMap.id).join(Match, MatchMap.match_id == Match.id).outerjoin(Event, Match.event_id == Event.id).where(Round.is_pistol.is_(True), (Match.team1_id == team.id) | (Match.team2_id == team.id), _included_event())
         )
-        pistol_won = session.scalar(select(func.count(Round.id)).where(Round.is_pistol.is_(True), Round.winner_team_id == team.id))
+        pistol_won = session.scalar(
+            select(func.count(Round.id)).join(MatchMap, Round.match_map_id == MatchMap.id).join(Match, MatchMap.match_id == Match.id).outerjoin(Event, Match.event_id == Event.id).where(Round.is_pistol.is_(True), Round.winner_team_id == team.id, _included_event())
+        )
         session.add(
             TeamRollingMetric(
                 team_id=team.id,
@@ -48,4 +71,3 @@ def compute_metrics(session: Session) -> int:
         )
         count += 1
     return count
-

@@ -14,6 +14,8 @@ depends_on = None
 
 
 def upgrade() -> None:
+    if "job_runs" in sa.inspect(op.get_bind()).get_table_names():
+        return
     op.create_table(
         "job_runs",
         sa.Column("id", sa.Integer(), primary_key=True),

@@ -179,6 +179,29 @@ class GridSyncCursor(Base):
     last_result_json: Mapped[str | None] = mapped_column(Text)
 
 
+class GridBackfillDay(Base):
+    __tablename__ = "grid_backfill_days"
+    __table_args__ = (UniqueConstraint("cursor_name", "day", name="uq_grid_backfill_day"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    cursor_name: Mapped[str] = mapped_column(String(80), index=True)
+    day: Mapped[str] = mapped_column(String(10), index=True)
+    date_from: Mapped[datetime] = mapped_column(DateTime)
+    date_to: Mapped[datetime] = mapped_column(DateTime)
+    status: Mapped[str] = mapped_column(String(40), default="pending", index=True)
+    pages: Mapped[int] = mapped_column(Integer, default=0)
+    checked: Mapped[int] = mapped_column(Integer, default=0)
+    matched_top30: Mapped[int] = mapped_column(Integer, default=0)
+    saved: Mapped[int] = mapped_column(Integer, default=0)
+    skipped: Mapped[int] = mapped_column(Integer, default=0)
+    errors: Mapped[int] = mapped_column(Integer, default=0)
+    new_matches: Mapped[int] = mapped_column(Integer, default=0)
+    updated_matches: Mapped[int] = mapped_column(Integer, default=0)
+    result_json: Mapped[str | None] = mapped_column(Text)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
+
+
 class GridEntityMap(Base):
     __tablename__ = "grid_entity_maps"
     __table_args__ = (UniqueConstraint("entity_type", "grid_id", name="uq_grid_entity"),)
@@ -188,6 +211,20 @@ class GridEntityMap(Base):
     grid_id: Mapped[str] = mapped_column(String(160), index=True)
     local_table: Mapped[str | None] = mapped_column(String(80))
     local_id: Mapped[int | None] = mapped_column(Integer, index=True)
+    name: Mapped[str | None] = mapped_column(String(255), index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
+
+
+class ExternalEntityMap(Base):
+    __tablename__ = "external_entity_maps"
+    __table_args__ = (UniqueConstraint("provider", "entity_type", "external_id", name="uq_external_entity"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    provider: Mapped[str] = mapped_column(String(40), index=True)
+    entity_type: Mapped[str] = mapped_column(String(40), index=True)
+    external_id: Mapped[str] = mapped_column(String(160), index=True)
+    local_table: Mapped[str] = mapped_column(String(80))
+    local_id: Mapped[int] = mapped_column(Integer, index=True)
     name: Mapped[str | None] = mapped_column(String(255), index=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
 
@@ -239,6 +276,22 @@ class JobRun(Base):
     started_at: Mapped[datetime | None] = mapped_column(DateTime)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime)
     duration_seconds: Mapped[float | None] = mapped_column(Float)
+
+
+class AutomationSetting(Base):
+    __tablename__ = "automation_settings"
+
+    id: Mapped[int] = mapped_column(primary_key=True, default=1)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    interval_minutes: Mapped[int] = mapped_column(Integer, default=60)
+    upcoming_days: Mapped[int] = mapped_column(Integer, default=14)
+    results_days: Mapped[int] = mapped_column(Integer, default=7)
+    top_limit: Mapped[int] = mapped_column(Integer, default=50)
+    max_matches: Mapped[int] = mapped_column(Integer, default=500)
+    refresh_stats: Mapped[bool] = mapped_column(Boolean, default=True)
+    last_started_at: Mapped[datetime | None] = mapped_column(DateTime)
+    next_run_at: Mapped[datetime | None] = mapped_column(DateTime)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
 
 
 class TeamRollingMetric(Base):

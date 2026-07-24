@@ -19,6 +19,10 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
   "pytest>=8.2",
+  "ruff>=0.9",
+]
+demo = [
+  "awpy>=2.0",
 ]
 
 [tool.pytest.ini_options]
@@ -28,6 +32,18 @@ markers = [
   "live: tests that contact HLTV and must be run manually",
 ]
 pythonpath = ["."]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+exclude = [
+  "app/web/static",
+  "data",
+  "tests/fixtures",
+]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
 
 [build-system]
 requires = ["setuptools>=68"]

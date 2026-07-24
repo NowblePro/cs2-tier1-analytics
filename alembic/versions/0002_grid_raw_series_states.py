@@ -14,6 +14,8 @@ depends_on = None
 
 
 def upgrade() -> None:
+    if "grid_raw_series_states" in sa.inspect(op.get_bind()).get_table_names():
+        return
     op.create_table(
         "grid_raw_series_states",
         sa.Column("id", sa.Integer(), primary_key=True),

@@ -5,7 +5,7 @@ from app.scraping.dto import RankingSnapshotDTO, RankingTeamDTO
 from app.scraping.parsing_utils import attr_int, clean_text, int_or_none, parse_hltv_id_from_href, soup
 
 
-def parse_ranking(html: str, source_url: str) -> RankingSnapshotDTO:
+def parse_ranking(html: str, source_url: str, limit: int = 100) -> RankingSnapshotDTO:
     doc = soup(html)
     date_value = doc.select_one("[data-ranking-date]")
     ranking_date = datetime.now(UTC).replace(tzinfo=None)
@@ -39,6 +39,6 @@ def parse_ranking(html: str, source_url: str) -> RankingSnapshotDTO:
         logo = row.select_one("img")
         teams.append(RankingTeamDTO(rank=rank, hltv_team_id=hltv_team_id, name=name, country=country, points=points, logo_url=logo.get("src") if logo else None))
         previous_rank = rank
-        if len(teams) >= 30:
+        if len(teams) >= limit:
             break
     return RankingSnapshotDTO(ranking_date=ranking_date, source_url=source_url, teams=teams)

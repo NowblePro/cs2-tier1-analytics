@@ -12,6 +12,22 @@ export class ApiError extends Error {
   }
 }
 
+function apiErrorDetail(payload: unknown): string {
+  if (!payload || typeof payload !== "object") return String(payload ?? "");
+  const root = payload as JsonRecord;
+  const detail = root.detail ?? root.message;
+  if (Array.isArray(detail)) {
+    return detail.map((item) => {
+      const issue = asRecord(item);
+      const location = Array.isArray(issue.loc) ? issue.loc.slice(1).join(".") : "";
+      const message = String(issue.msg ?? issue.message ?? "Некорректное значение");
+      return location ? `${location}: ${message}` : message;
+    }).join("; ");
+  }
+  if (detail && typeof detail === "object") return JSON.stringify(detail);
+  return String(detail ?? "");
+}
+
 export const api = {
   get demo() { return isDemoMode(); },
   async request(path: string, init: RequestInit = {}) {
@@ -25,7 +41,7 @@ export const api = {
     const contentType = response.headers.get("content-type") ?? "";
     const payload = contentType.includes("application/json") ? await response.json() : await response.text();
     if (!response.ok) {
-      const detail = typeof payload === "object" && payload ? String(payload.detail ?? payload.message ?? "") : String(payload);
+      const detail = apiErrorDetail(payload);
       throw new ApiError(`Request failed (${response.status})`, response.status, detail);
     }
     return normalizeResponse(path, payload);
@@ -74,9 +90,9 @@ export function asArray(value: unknown, keys: string[] = []): JsonRecord[] {
 }
 export function getId(value: unknown, fallback: unknown = "unknown") { const r = asRecord(value); return String(r.id ?? r.team_id ?? r.match_id ?? r.player_id ?? r.grid_id ?? fallback); }
 export function getName(value: unknown, fallback = "Unknown") { if (typeof value === "string") return value; const r = asRecord(value); return String(r.name ?? r.team_name ?? r.player_name ?? r.nickname ?? r.map_name ?? fallback); }
-export function formatNumber(value: unknown, digits = 0) { const n = Number(value); if (!Number.isFinite(n)) return "—"; const shown = digits ? n.toFixed(digits) : Math.round(n).toLocaleString("en-US"); return n > 0 && digits === 1 && String(value).startsWith("+") ? `+${shown}` : shown; }
-export function formatPercent(value: unknown) { let n = Number(value); if (!Number.isFinite(n)) return "—"; if (Math.abs(n) <= 1) n *= 100; const rounded = Math.round(n * 10) / 10; return `${rounded.toFixed(Number.isInteger(rounded) ? 0 : 1)}%`; }
-export function formatDate(value: unknown) { if (!value) return "Never"; const date = new Date(String(value)); if (Number.isNaN(date.getTime())) return String(value); return new Intl.DateTimeFormat("en-GB", { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" }).format(date); }
+export function formatNumber(value: unknown, digits = 0) { if (value == null || value === "") return "—"; const n = Number(value); if (!Number.isFinite(n)) return "—"; const shown = digits ? n.toFixed(digits) : Math.round(n).toLocaleString("en-US"); return n > 0 && digits === 1 && String(value).startsWith("+") ? `+${shown}` : shown; }
+export function formatPercent(value: unknown) { if (value == null || value === "") return "—"; let n = Number(value); if (!Number.isFinite(n)) return "—"; if (Math.abs(n) <= 1) n *= 100; const rounded = Math.round(n * 10) / 10; return `${rounded.toFixed(Number.isInteger(rounded) ? 0 : 1)}%`; }
+export function formatDate(value: unknown) { if (!value) return "—"; const raw = String(value); const utcValue = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?$/.test(raw) ? `${raw}Z` : raw; const date = new Date(utcValue); if (Number.isNaN(date.getTime())) return raw; return new Intl.DateTimeFormat("ru-RU", { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" }).format(date); }
 export function isStale(value: unknown, hours: number) { if (!value) return true; const date = new Date(String(value)); return Number.isNaN(date.getTime()) || Date.now() - date.getTime() > hours * 3_600_000; }
 
 function normalizeQueryParams(path: string, params: JsonRecord): JsonRecord {
@@ -85,6 +101,10 @@ function normalizeQueryParams(path: string, params: JsonRecord): JsonRecord {
   if (next.from && !next.date_from) next.date_from = next.from;
   if (next.to && !next.date_to) next.date_to = next.to;
   if (next.map && !next.map_name) next.map_name = next.map;
+  for (const key of ["date_from", "date_to"]) {
+    const value = next[key];
+    if (typeof value === "string" && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(value)) next[key] = new Date(value).toISOString();
+  }
   delete next.from;
   delete next.to;
   delete next.map;
@@ -122,7 +142,12 @@ function normalizeResponse(path: string, payload: unknown): unknown {
   if (cleanPath === endpoints.teams) return asArray(payload).map(normalizeTeamRow);
   if (/^\/api\/teams\/[^/]+$/.test(cleanPath)) return normalizeTeamDetail(payload);
   if (cleanPath === endpoints.compare) return normalizeCompare(payload);
-  if (cleanPath === endpoints.matches || cleanPath === endpoints.upcoming) return asArray(payload, ["matches", "upcoming", "items", "results"]).map(normalizeMatchRow);
+  if (cleanPath === endpoints.matches) {
+    if (Array.isArray(payload)) return payload.map(normalizeMatchRow);
+    const root = asRecord(payload);
+    return { ...root, items: asArray(root.items, ["matches", "items", "results"]).map(normalizeMatchRow) };
+  }
+  if (cleanPath === endpoints.upcoming) return asArray(payload, ["matches", "upcoming", "items", "results"]).map(normalizeMatchRow);
   if (/^\/api\/matches\/[^/]+\/preview$/.test(cleanPath)) return normalizePreview(payload);
   if (cleanPath === endpoints.maps) return normalizeMaps(payload);
   if (cleanPath === endpoints.validate) return normalizeValidation(payload);
@@ -178,7 +203,7 @@ function normalizeMatchRow(value: unknown): JsonRecord {
     event_name: match.event_name ?? match.event,
     team1_score: match.team1_score ?? match.score_team1,
     team2_score: match.team2_score ?? match.score_team2,
-    format: match.format ?? (Array.isArray(match.maps) && match.maps.length ? `BO${match.maps.length}` : undefined),
+    format: match.format ?? (match.best_of ? `BO${match.best_of}` : undefined),
   };
 }
 
@@ -274,7 +299,7 @@ function normalizeValidation(payload: unknown): JsonRecord {
   return {
     ...root,
     passed: issues.filter((issue) => Number(issue.count ?? 0) === 0).length,
-    warnings: issues.filter((issue) => Number(issue.count ?? 0) > 0).length,
+    warnings: 0,
     errors: root.ok === false ? issues.filter((issue) => Number(issue.count ?? 0) > 0).length : 0,
     checks: issues.map((issue) => ({ ...issue, name: issue.message ?? issue.code, status: Number(issue.count ?? 0) ? "failed" : "passed", affected: issue.count })),
   };

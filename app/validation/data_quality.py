@@ -5,9 +5,8 @@ from typing import Any
 from sqlalchemy import case, func, select
 from sqlalchemy.orm import Session
 
+from app.grid.ingest import KNOWN_MAPS
 from app.models.schema import Match, MatchMap, Player, PlayerMapStat, Round, TeamRollingMetric
-
-KNOWN_MAPS = {"Ancient", "Anubis", "Cache", "Cobblestone", "Dust2", "GRID Unknown", "Inferno", "Mirage", "Nuke", "Overpass", "Train", "Vertigo"}
 
 
 def _issue(code: str, message: str, count: int) -> dict[str, Any]:
