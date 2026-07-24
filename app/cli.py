@@ -12,7 +12,7 @@ from app.config import get_settings
 from app.analytics import estimate_backfill
 from app.db import get_session_factory
 from app.demos import AwpyUnavailableError, import_demo_to_match_map, inspect_demo_file
-from app.dust2 import Dust2Client, Dust2FetchError, import_dust2_match, parse_dust2_match, resolve_dust2_match
+from app.dust2 import Dust2Client, Dust2FetchError, import_dust2_match, parse_dust2_match, resolve_dust2_match, sync_missing_dust2_rounds
 from app.logging import configure_logging
 from app.grid import GridClient, ingest_recent_grid_series, ingest_upcoming_grid_series, refresh_live_grid_matches, run_grid_backfill, run_grid_update_since_cursor
 from app.grid.ingest import _series_is_cs2, grid_state_to_match, latest_top_team_names, normalize_name, save_grid_identity_maps, save_raw_grid_state
@@ -885,6 +885,28 @@ def dust2_resolve_match(args: argparse.Namespace) -> None:
         logger.info("dust2-resolve-match duration=%.2fs", time.monotonic() - started)
 
 
+def dust2_sync_rounds(args: argparse.Namespace) -> None:
+    settings = get_settings()
+    Session = get_session_factory(settings)
+    started = time.monotonic()
+    try:
+        with Dust2Client(settings) as client:
+            with Session.begin() as session:
+                result = sync_missing_dust2_rounds(
+                    session,
+                    client,
+                    match_ids=args.match_id,
+                    limit=args.limit,
+                )
+                compute_metrics(session)
+        print_json(result, ensure_ascii=False)
+    except (Dust2FetchError, RuntimeError, ValueError) as exc:
+        logger.error("%s", exc)
+        print(str(exc))
+    finally:
+        logger.info("dust2-sync-rounds duration=%.2fs", time.monotonic() - started)
+
+
 def normalize_grid_maps(_: argparse.Namespace) -> None:
     Session = get_session_factory()
     with Session.begin() as session:
@@ -1308,6 +1330,11 @@ def build_parser() -> argparse.ArgumentParser:
     dust2_resolve_parser.add_argument("--import-best", action="store_true")
     dust2_resolve_parser.add_argument("--import-player-stats", action="store_true")
     dust2_resolve_parser.set_defaults(func=dust2_resolve_match)
+
+    dust2_sync_parser = sub.add_parser("dust2-sync-rounds")
+    dust2_sync_parser.add_argument("--limit", type=int, default=100, help="Maximum completed matches to check")
+    dust2_sync_parser.add_argument("--match-id", type=int, action="append", default=None, help="Check only this local match; repeat for several matches")
+    dust2_sync_parser.set_defaults(func=dust2_sync_rounds)
 
     normalize = sub.add_parser("normalize-grid-maps")
     normalize.set_defaults(func=normalize_grid_maps)
