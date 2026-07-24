@@ -84,7 +84,8 @@ class AnalyticsRepository:
             match_map.second_half_team2 = map_dto.second_half_team2
             match_map.overtime = map_dto.overtime
             self.session.flush()
-            self._replace_rounds(match_map, dto)
+            if any(round_dto.map_number == match_map.map_number for round_dto in dto.rounds):
+                self._replace_rounds(match_map, dto)
             self._upsert_player_stats(match_map, dto)
         return match
 
@@ -131,4 +132,3 @@ class AnalyticsRepository:
             row.kast = stat.kast
             row.rating = stat.rating
             row.headshot_percentage = stat.headshot_percentage
-
