@@ -17,8 +17,8 @@ DUST2_HTML = """
     <div class="lineup"><img class="team-logo" alt="Aurora" /></div>
     <div class="map-container">
       <div class="map-container-map-name">Cache</div>
-      <div class="map-container-score-left">13</div>
-      <div class="map-container-score-right">11</div>
+      <div class="map-container-score-left">2</div>
+      <div class="map-container-score-right">1</div>
     </div>
     <div class="round-breakdown-container">
       <div class="round-breakdown-team-wrapper">
@@ -53,8 +53,8 @@ def test_parse_dust2_match_maps_and_rounds():
     assert parsed.team1_name == "FOKUS"
     assert parsed.team2_name == "Aurora"
     assert parsed.maps[0].name == "Cache"
-    assert parsed.maps[0].score_team1 == 13
-    assert parsed.maps[0].score_team2 == 11
+    assert parsed.maps[0].score_team1 == 2
+    assert parsed.maps[0].score_team2 == 1
     assert [(row.round_number, row.winner_team_name, row.winner_side, row.is_pistol) for row in parsed.rounds] == [
         (1, "Aurora", "CT", True),
         (2, "FOKUS", "T", False),
@@ -94,11 +94,61 @@ def test_import_dust2_match_replaces_rounds_and_updates_map():
     assert result.maps_imported == 1
     assert result.rounds_imported == 3
     assert match_map.name == "Cache"
-    assert match_map.score_team1 == 13
-    assert match_map.score_team2 == 11
+    assert match_map.score_team1 == 2
+    assert match_map.score_team2 == 1
     assert [row.round_number for row in rounds] == [1, 2, 13]
     assert rounds[0].winner_team_id is not None
     assert rounds[0].is_pistol
+
+    engine.dispose()
+
+
+def test_import_dust2_match_clears_incomplete_round_history():
+    engine = create_engine("sqlite:///:memory:", future=True)
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine, future=True)
+
+    incomplete_html = DUST2_HTML.replace(
+        '<div class="map-container-score-left">2</div>',
+        '<div class="map-container-score-left">16</div>',
+    ).replace(
+        '<div class="map-container-score-right">1</div>',
+        '<div class="map-container-score-right">19</div>',
+    )
+
+    with Session.begin() as session:
+        fokus = Team(hltv_team_id=1, name="FOKUS", country=None)
+        aurora = Team(hltv_team_id=2, name="Aurora Gaming", country=None)
+        session.add_all([fokus, aurora])
+        session.flush()
+        match = Match(
+            hltv_match_id=10,
+            match_time=datetime.now(UTC).replace(tzinfo=None),
+            status="completed",
+            team1_id=fokus.id,
+            team2_id=aurora.id,
+            source_url="test://match",
+        )
+        session.add(match)
+        session.flush()
+        match_map = MatchMap(match_id=match.id, map_number=1, name="Cache", score_team1=16, score_team2=19)
+        session.add(match_map)
+        session.flush()
+        session.add(Round(match_map_id=match_map.id, round_number=1, is_pistol=True, winner_team_id=fokus.id))
+        match_id = match.id
+
+    with Session.begin() as session:
+        result = import_dust2_match(session, incomplete_html, match_id=match_id)
+
+    with Session() as session:
+        match_map = session.scalar(select(MatchMap).where(MatchMap.match_id == match_id))
+        rounds = session.scalars(select(Round).where(Round.match_map_id == match_map.id)).all()
+
+    assert result.maps_imported == 1
+    assert result.rounds_imported == 0
+    assert match_map.score_team1 == 16
+    assert match_map.score_team2 == 19
+    assert rounds == []
 
     engine.dispose()
 

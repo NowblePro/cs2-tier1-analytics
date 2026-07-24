@@ -64,8 +64,13 @@ def import_dust2_match(
         match_map.second_half_team1 = _second_half_score(dust2_map.score_team1, match_map.first_half_team1)
         match_map.second_half_team2 = _second_half_score(dust2_map.score_team2, match_map.first_half_team2)
         match_map.overtime = (dust2_map.score_team1 + dust2_map.score_team2) > 24
+        map_rounds = [item for item in parsed.rounds if item.map_number == dust2_map.map_number]
+        expected_rounds = (dust2_map.score_team1 or 0) + (dust2_map.score_team2 or 0)
         session.query(Round).filter(Round.match_map_id == match_map.id).delete()
-        for dust2_round in [item for item in parsed.rounds if item.map_number == dust2_map.map_number]:
+        if len(map_rounds) != expected_rounds:
+            maps_imported += 1
+            continue
+        for dust2_round in map_rounds:
             winner = dust2_teams.get(dust2_round.winner_team_name)
             session.add(
                 Round(
