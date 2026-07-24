@@ -19,6 +19,7 @@ class Dust2ImportResult:
     rounds_imported: int
     player_stats_imported: int
     url: str | None = None
+    round_statuses: list[dict[str, object]] | None = None
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -27,6 +28,7 @@ class Dust2ImportResult:
             "rounds_imported": self.rounds_imported,
             "player_stats_imported": self.player_stats_imported,
             "url": self.url,
+            "round_statuses": self.round_statuses or [],
         }
 
 
@@ -49,6 +51,7 @@ def import_dust2_match(
     maps_imported = 0
     rounds_imported = 0
     player_stats_imported = 0
+    round_statuses: list[dict[str, object]] = []
     for dust2_map in parsed.maps:
         match_map = session.scalar(select(MatchMap).where(MatchMap.match_id == match.id, MatchMap.map_number == dust2_map.map_number))
         if match_map is None:
@@ -68,8 +71,16 @@ def import_dust2_match(
         expected_rounds = (dust2_map.score_team1 or 0) + (dust2_map.score_team2 or 0)
         session.query(Round).filter(Round.match_map_id == match_map.id).delete()
         if len(map_rounds) != expected_rounds:
+            if len(map_rounds) == 0:
+                reason = "Раундов нет: на Dust2 нет раундовой истории для этой карты"
+            else:
+                reason = f"Раундов нет: Dust2 отдал неполную историю ({len(map_rounds)} из {expected_rounds})"
+            _save_map_round_status(session, match_map, "incomplete", reason)
+            round_statuses.append({"map_id": match_map.id, "status": "incomplete", "reason": reason})
             maps_imported += 1
             continue
+        _save_map_round_status(session, match_map, "complete", f"Раунды загружены с Dust2: {len(map_rounds)}")
+        round_statuses.append({"map_id": match_map.id, "status": "complete", "reason": f"Раунды загружены с Dust2: {len(map_rounds)}"})
         for dust2_round in map_rounds:
             winner = dust2_teams.get(dust2_round.winner_team_name)
             session.add(
@@ -107,7 +118,7 @@ def import_dust2_match(
         maps_imported += 1
     if url:
         _save_match_source(session, url, match.id, parsed)
-    return Dust2ImportResult(match_id=match.id, maps_imported=maps_imported, rounds_imported=rounds_imported, player_stats_imported=player_stats_imported, url=url)
+    return Dust2ImportResult(match_id=match.id, maps_imported=maps_imported, rounds_imported=rounds_imported, player_stats_imported=player_stats_imported, url=url, round_statuses=round_statuses)
 
 
 def _resolve_dust2_teams(session: Session, parsed: Dust2Match, team1: Team | None, team2: Team | None) -> dict[str, Team]:
@@ -172,6 +183,23 @@ def _save_match_source(session: Session, url: str, match_id: int, parsed: Dust2M
         session.add(row)
     row.local_id = match_id
     row.name = parsed.title or row.name
+
+
+def _save_map_round_status(session: Session, match_map: MatchMap, status: str, reason: str) -> None:
+    external_id = f"match_map:{match_map.id}"
+    row = _external_entity_map(session, "map_rounds", external_id)
+    if row is None:
+        row = ExternalEntityMap(
+            provider="dust2",
+            entity_type="map_rounds",
+            external_id=external_id,
+            local_table="match_maps",
+            local_id=match_map.id,
+            name=reason,
+        )
+        session.add(row)
+    row.local_id = match_map.id
+    row.name = reason
 
 
 def _dust2_external_id(url: str) -> str:

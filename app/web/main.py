@@ -16,6 +16,7 @@ from sqlalchemy.orm import aliased
 
 from app.config import get_settings
 from app.analytics import estimate_backfill, grid_stats_summary, pre_match_edge
+from app.dust2 import Dust2Client, sync_missing_dust2_rounds
 from app.grid import GridClient, audit_grid_period, ingest_grid_history_for_team_ids, ingest_recent_grid_series, ingest_upcoming_grid_series, refresh_live_grid_matches, refresh_saved_grid_matches, reset_backfill_days, run_grid_backfill, run_grid_update_since_cursor
 from app.grid.client import GridApiError
 from app.grid.ingest import _series_is_cs2, normalize_name
@@ -23,7 +24,7 @@ from app.repositories.team_aliases import canonical_team_key, merge_team_aliases
 from app.grid.stats import refresh_grid_stats
 from app.jobs import create_job_run, run_post_sync_pipeline, serialize_job_run, update_job_run
 from app.metrics import compute_metrics
-from app.models.schema import AutomationSetting, Event, GridBackfillDay, GridEntityMap, GridRawSeriesState, GridStatsSnapshot, GridSyncCursor, JobRun, Match, MatchMap, Player, PlayerMapStat, RankingSnapshot, RankingSnapshotTeam, Round, Team, TeamRollingMetric
+from app.models.schema import AutomationSetting, Event, ExternalEntityMap, GridBackfillDay, GridEntityMap, GridRawSeriesState, GridStatsSnapshot, GridSyncCursor, JobRun, Match, MatchMap, Player, PlayerMapStat, RankingSnapshot, RankingSnapshotTeam, Round, Team, TeamRollingMetric
 from app.pandascore import PandaScoreClient, ingest_past_pandascore_results, ingest_team_pandascore_history, ingest_upcoming_with_histories
 from app.quality import period_quality_report
 from app.valve_vrs import ValveVrsClient, ingest_latest_valve_ranking
@@ -1041,6 +1042,37 @@ def _run_grid_sync_job(job_id: str, payload: GridSyncRequest) -> None:
                 else:
                     if payload.mode in {"team", "match"}:
                         result["cleanup"] = merge_team_aliases(session, dry_run=False)
+                        dust2_client = Dust2Client()
+                        try:
+                            if payload.mode == "match" and payload.match_id is not None:
+                                match_ids = [payload.match_id]
+                                rounds_limit = 1
+                            elif payload.mode == "team" and payload.team_id is not None:
+                                match_ids = list(session.scalars(
+                                    select(Match.id)
+                                    .where(
+                                        ((Match.team1_id == payload.team_id) | (Match.team2_id == payload.team_id)),
+                                        Match.status == "completed",
+                                        Match.match_time >= date_from,
+                                        Match.match_time <= date_to,
+                                    )
+                                    .order_by(desc(Match.match_time), desc(Match.id))
+                                    .limit(min(payload.max_matches, 50))
+                                ))
+                                rounds_limit = min(payload.max_matches, 50)
+                            else:
+                                match_ids = None
+                                rounds_limit = 25
+                            result["rounds"] = sync_missing_dust2_rounds(
+                                session=session,
+                                client=dust2_client,
+                                match_ids=match_ids,
+                                limit=rounds_limit,
+                                progress=lambda item: _set_job_progress(job_id, item),
+                                should_cancel=cancel_event.is_set,
+                            )
+                        finally:
+                            dust2_client.close()
                     compute_metrics(session)
             if payload.mode == "backfill":
                 session.commit()
@@ -1627,6 +1659,14 @@ def match_detail(match_id: int):
         rounds = session.scalars(
             select(Round).where(Round.match_map_id.in_(map_ids)).order_by(Round.match_map_id, Round.round_number)
         ).all() if map_ids else []
+        round_status_rows = session.scalars(
+            select(ExternalEntityMap).where(
+                ExternalEntityMap.provider == "dust2",
+                ExternalEntityMap.entity_type == "map_rounds",
+                ExternalEntityMap.local_id.in_(map_ids),
+            )
+        ).all() if map_ids else []
+        round_status_by_map = {row.local_id: row.name for row in round_status_rows}
         stats = session.execute(
             select(PlayerMapStat, Player, Team, MatchMap)
             .join(Player, PlayerMapStat.player_id == Player.id)
@@ -1703,6 +1743,11 @@ def match_detail(match_id: int):
                 "team2_stats": aggregate(match.team2_id, item.id),
                 "team1_rounds": round_aggregate(match.team1_id, item.id),
                 "team2_rounds": round_aggregate(match.team2_id, item.id),
+                "round_status": {
+                    "provider": "dust2",
+                    "reason": round_status_by_map.get(item.id) or "Раундов нет: источник с полной историей пока не найден",
+                    "checked": item.id in round_status_by_map,
+                },
                 "player_stats": map_stats,
                 "round_history": [
                     {

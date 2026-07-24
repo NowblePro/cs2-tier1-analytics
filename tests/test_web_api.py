@@ -62,6 +62,7 @@ def test_detailed_match_exposes_team_and_per_map_statistics():
     assert match["maps"]
     assert {"team1_stats", "team2_stats", "first_half_team1", "second_half_team1"}.issubset(match["maps"][0])
     assert {"team1_rounds", "team2_rounds", "round_history", "picked_by_team_id", "player_stats"}.issubset(match["maps"][0])
+    assert {"provider", "reason", "checked"}.issubset(match["maps"][0]["round_status"])
     assert match["maps"][0]["player_stats"]
     assert {"team1_rounds", "team2_rounds", "best_of"}.issubset(match)
     assert {"player_id", "team_id", "map_id"}.issubset(match["player_stats"][0])

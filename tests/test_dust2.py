@@ -6,7 +6,7 @@ from sqlalchemy.orm import sessionmaker
 from app.dust2.importer import import_dust2_match
 from app.dust2.parser import parse_dust2_match
 from app.dust2.resolver import resolve_dust2_match
-from app.models.schema import Base, Match, MatchMap, Round, Team
+from app.models.schema import Base, ExternalEntityMap, Match, MatchMap, Round, Team
 
 
 DUST2_HTML = """
@@ -143,12 +143,21 @@ def test_import_dust2_match_clears_incomplete_round_history():
     with Session() as session:
         match_map = session.scalar(select(MatchMap).where(MatchMap.match_id == match_id))
         rounds = session.scalars(select(Round).where(Round.match_map_id == match_map.id)).all()
+        status = session.scalar(
+            select(ExternalEntityMap).where(
+                ExternalEntityMap.provider == "dust2",
+                ExternalEntityMap.entity_type == "map_rounds",
+                ExternalEntityMap.local_id == match_map.id,
+            )
+        )
 
     assert result.maps_imported == 1
     assert result.rounds_imported == 0
     assert match_map.score_team1 == 16
     assert match_map.score_team2 == 19
     assert rounds == []
+    assert status is not None
+    assert "неполную историю" in status.name
 
     engine.dispose()
 

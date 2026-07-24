@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 
 from app.grid.client import GridClient
 from app.grid.stats import refresh_grid_stats
+from app.dust2 import Dust2Client, sync_missing_dust2_rounds
 from app.metrics import compute_metrics
 from app.models.schema import JobRun
 from app.quality import normalize_saved_map_names
@@ -98,6 +99,21 @@ def run_post_sync_pipeline(
     if progress:
         progress({"stage": "aliases", "progress_percent": 0})
     result["team_aliases"] = merge_team_aliases(session, dry_run=False)
+    if should_cancel and should_cancel():
+        return {**result, "cancelled": True}
+    if progress:
+        progress({"stage": "rounds", "provider": "dust2", "progress_percent": 0})
+    dust2_client = Dust2Client()
+    try:
+        result["rounds"] = sync_missing_dust2_rounds(
+            session=session,
+            client=dust2_client,
+            limit=25,
+            progress=progress,
+            should_cancel=should_cancel,
+        )
+    finally:
+        dust2_client.close()
     if should_cancel and should_cancel():
         return {**result, "cancelled": True}
     if progress:
